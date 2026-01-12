@@ -9,6 +9,7 @@ typedef struct {
     int vocab_size;
     int seq_len;
     int hidden_size;
+    int num_layers;
     int l_cycles;
     float rms_eps;
 } Config;
@@ -55,6 +56,11 @@ typedef struct {
     float *x_norm; // normalized x (seq_len x hidden)
 } BlockCache;
 
+typedef struct {
+    BlockCache *items;
+    int count;
+} BlockCacheStack;
+
 static BlockCache alloc_block_cache(int seq_len, int hidden_size) {
     BlockCache cache = {
         .x = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size),
@@ -68,6 +74,16 @@ static BlockCache alloc_block_cache(int seq_len, int hidden_size) {
     return cache;
 }
 
+static BlockCacheStack alloc_block_cache_stack(int count, int seq_len, int hidden_size) {
+    BlockCacheStack stack;
+    stack.count = count;
+    stack.items = malloc(sizeof(BlockCache) * (size_t)count);
+    for (int i = 0; i < count; i++) {
+        stack.items[i] = alloc_block_cache(seq_len, hidden_size);
+    }
+    return stack;
+}
+
 static void free_block_cache(BlockCache *cache) {
     free(cache->x);
     free(cache->u);
@@ -76,6 +92,13 @@ static void free_block_cache(BlockCache *cache) {
     free(cache->y);
     free(cache->rms_norm);
     free(cache->x_norm);
+}
+
+static void free_block_cache_stack(BlockCacheStack *stack) {
+    for (int i = 0; i < stack->count; i++) {
+        free_block_cache(&stack->items[i]);
+    }
+    free(stack->items);
 }
 
 static float randf() {
@@ -306,6 +329,54 @@ static void block_backward(Model *model, const float *d_output, BlockCache *cach
         free(d_v);
         free(d_u);
     }
+}
+
+static void forward_layers(Model *model, const float *input, float *output, BlockCacheStack *stack,
+                           float *workspace_a, float *workspace_b) {
+    int hidden = model->cfg.hidden_size;
+    int seq_len = model->cfg.seq_len;
+
+    if (stack->count == 1) {
+        block_forward(model, input, output, &stack->items[0]);
+        return;
+    }
+
+    const float *src = input;
+    float *dst = workspace_a;
+    for (int layer = 0; layer < stack->count; layer++) {
+        if (layer == stack->count - 1) {
+            dst = output;
+        }
+        block_forward(model, src, dst, &stack->items[layer]);
+        if (layer < stack->count - 1) {
+            const float *tmp_src = src;
+            src = dst;
+            dst = (dst == workspace_a) ? workspace_b : workspace_a;
+            (void)tmp_src;
+        }
+    }
+}
+
+static void backward_layers(Model *model, BlockCacheStack *stack, const float *d_output, float *d_input) {
+    int hidden = model->cfg.hidden_size;
+    int seq_len = model->cfg.seq_len;
+    size_t size = (size_t)seq_len * (size_t)hidden;
+
+    float *d_curr = malloc(sizeof(float) * size);
+    float *d_next = malloc(sizeof(float) * size);
+    memcpy(d_curr, d_output, sizeof(float) * size);
+
+    for (int layer = stack->count - 1; layer >= 0; layer--) {
+        zero_array(d_next, size);
+        block_backward(model, d_curr, &stack->items[layer], d_next);
+        float *swap = d_curr;
+        d_curr = d_next;
+        d_next = swap;
+    }
+
+    memcpy(d_input, d_curr, sizeof(float) * size);
+    free(d_curr);
+    free(d_next);
 }
 
 static void update_params(Model *model, float lr) {
@@ -572,7 +643,7 @@ static char id_to_char(const char *vocab, int vocab_size, int id) {
 }
 
 static void forward(Model *model, const int *tokens, float *logits,
-                    float *z_h, float *z_l, BlockCache *l_cache, BlockCache *h_cache,
+                    float *z_h, float *z_l, BlockCacheStack *l_cache, BlockCacheStack *h_cache,
                     float *input_embed) {
     Config cfg = model->cfg;
     int hidden = cfg.hidden_size;
@@ -595,21 +666,25 @@ static void forward(Model *model, const int *tokens, float *logits,
     }
 
     float *temp = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden);
+    float *layer_a = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden);
+    float *layer_b = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden);
     for (int step = 0; step < cfg.l_cycles; step++) {
         for (int t = 0; t < seq_len; t++) {
             for (int i = 0; i < hidden; i++) {
                 temp[t * hidden + i] = z_l[t * hidden + i] + z_h[t * hidden + i] + input_embed[t * hidden + i];
             }
         }
-        block_forward(model, temp, z_l, l_cache);
+        forward_layers(model, temp, z_l, l_cache, layer_a, layer_b);
     }
     for (int t = 0; t < seq_len; t++) {
         for (int i = 0; i < hidden; i++) {
             temp[t * hidden + i] = z_h[t * hidden + i] + z_l[t * hidden + i];
         }
     }
-    block_forward(model, temp, z_h, h_cache);
+    forward_layers(model, temp, z_h, h_cache, layer_a, layer_b);
     free(temp);
+    free(layer_a);
+    free(layer_b);
 
     for (int t = 0; t < seq_len; t++) {
         for (int v = 0; v < cfg.vocab_size; v++) {
@@ -650,7 +725,7 @@ static float softmax_loss(const float *logits, const int *targets, int seq_len, 
 
 static void backward(Model *model, const int *tokens, const float *d_logits,
                      float *z_h, float *z_l,
-                     BlockCache *l_cache, BlockCache *h_cache) {
+                     BlockCacheStack *l_cache, BlockCacheStack *h_cache) {
     Config cfg = model->cfg;
     int hidden = cfg.hidden_size;
     int seq_len = cfg.seq_len;
@@ -672,7 +747,7 @@ static void backward(Model *model, const int *tokens, const float *d_logits,
 
     float *d_input_h = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden);
     zero_array(d_input_h, (size_t)seq_len * (size_t)hidden);
-    block_backward(model, d_z_h, h_cache, d_input_h);
+    backward_layers(model, h_cache, d_z_h, d_input_h);
 
     for (int t = 0; t < seq_len; t++) {
         for (int i = 0; i < hidden; i++) {
@@ -683,7 +758,7 @@ static void backward(Model *model, const int *tokens, const float *d_logits,
 
     float *d_input_l = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden);
     zero_array(d_input_l, (size_t)seq_len * (size_t)hidden);
-    block_backward(model, d_z_l, l_cache, d_input_l);
+    backward_layers(model, l_cache, d_z_l, d_input_l);
 
     float scale = sqrtf((float)hidden);
     for (int t = 0; t < seq_len; t++) {
@@ -718,8 +793,8 @@ static void generate(Model *model, const char *vocab, const char *prompt, int st
     float *z_l = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size);
     float *input_embed = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size);
 
-    BlockCache l_cache = alloc_block_cache(seq_len, cfg.hidden_size);
-    BlockCache h_cache = alloc_block_cache(seq_len, cfg.hidden_size);
+    BlockCacheStack l_cache = alloc_block_cache_stack(cfg.num_layers, seq_len, cfg.hidden_size);
+    BlockCacheStack h_cache = alloc_block_cache_stack(cfg.num_layers, seq_len, cfg.hidden_size);
 
     printf("\nGenerated:\n");
     for (int step = 0; step < steps; step++) {
@@ -748,13 +823,13 @@ static void generate(Model *model, const char *vocab, const char *prompt, int st
     free(z_h);
     free(z_l);
     free(input_embed);
-    free_block_cache(&l_cache);
-    free_block_cache(&h_cache);
+    free_block_cache_stack(&l_cache);
+    free_block_cache_stack(&h_cache);
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: %s <text_file> [--save path] [--load path] [--generate N] [--prompt text] [--steps N] [--batch N] [--lr F]\n",
+        printf("Usage: %s <text_file> [--save path] [--load path] [--generate N] [--prompt text] [--steps N] [--batch N] [--lr F] [--layers N]\n",
                argv[0]);
         return 1;
     }
@@ -766,6 +841,7 @@ int main(int argc, char **argv) {
     int train_steps = 500;
     int batch_size = 4;
     float lr = 0.005f;
+    int num_layers = 2;
     const char *prompt = "Hello";
     const char *save_path = NULL;
     const char *load_path = NULL;
@@ -785,6 +861,8 @@ int main(int argc, char **argv) {
             batch_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
             lr = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--layers") == 0 && i + 1 < argc) {
+            num_layers = atoi(argv[++i]);
         }
     }
 
@@ -808,6 +886,7 @@ int main(int argc, char **argv) {
             .vocab_size = vocab_size,
             .seq_len = 32,
             .hidden_size = 64,
+            .num_layers = num_layers,
             .l_cycles = 2,
             .rms_eps = 1e-5f,
         };
@@ -822,8 +901,8 @@ int main(int argc, char **argv) {
     int *tokens = malloc(sizeof(int) * model.cfg.seq_len);
     int *targets = malloc(sizeof(int) * model.cfg.seq_len);
 
-    BlockCache l_cache = alloc_block_cache(model.cfg.seq_len, model.cfg.hidden_size);
-    BlockCache h_cache = alloc_block_cache(model.cfg.seq_len, model.cfg.hidden_size);
+    BlockCacheStack l_cache = alloc_block_cache_stack(model.cfg.num_layers, model.cfg.seq_len, model.cfg.hidden_size);
+    BlockCacheStack h_cache = alloc_block_cache_stack(model.cfg.num_layers, model.cfg.seq_len, model.cfg.hidden_size);
 
     if (text) {
         for (int step = 0; step < train_steps; step++) {
@@ -835,9 +914,9 @@ int main(int argc, char **argv) {
                     tokens[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t]);
                     targets[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t + 1]);
                 }
-                forward(&model, tokens, logits, z_h, z_l, &l_cache, &h_cache, input_embed);
+            forward(&model, tokens, logits, z_h, z_l, &l_cache, &h_cache, input_embed);
                 float loss = softmax_loss(logits, targets, model.cfg.seq_len, model.cfg.vocab_size, d_logits);
-                backward(&model, tokens, d_logits, z_h, z_l, &l_cache, &h_cache);
+            backward(&model, tokens, d_logits, z_h, z_l, &l_cache, &h_cache);
                 batch_loss += loss;
             }
             scale_gradients(&model, 1.0f / (float)batch_size);
@@ -872,7 +951,7 @@ int main(int argc, char **argv) {
     free(d_logits);
     free(tokens);
     free(targets);
-    free_block_cache(&l_cache);
-    free_block_cache(&h_cache);
+    free_block_cache_stack(&l_cache);
+    free_block_cache_stack(&h_cache);
     return 0;
 }
