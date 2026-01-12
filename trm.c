@@ -656,7 +656,7 @@ static void generate(Model *model, const char *vocab, const char *prompt, int st
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: %s <text_file> [--save path] [--load path] [--generate N] [--prompt text]\n",
+        printf("Usage: %s <text_file> [--save path] [--load path] [--generate N] [--prompt text] [--steps N]\n",
                argv[0]);
         return 1;
     }
@@ -665,6 +665,7 @@ int main(int argc, char **argv) {
     Model model;
     srand(0);
     int generate_steps = 200;
+    int train_steps = 500;
     const char *prompt = "Hello";
     const char *save_path = NULL;
     const char *load_path = NULL;
@@ -678,6 +679,8 @@ int main(int argc, char **argv) {
             generate_steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
+            train_steps = atoi(argv[++i]);
         }
     }
 
@@ -735,9 +738,8 @@ int main(int argc, char **argv) {
     };
 
     if (text) {
-        int steps = 500;
         float lr = 0.01f;
-        for (int step = 0; step < steps; step++) {
+        for (int step = 0; step < train_steps; step++) {
             int start = rand() % (int)(len - model.cfg.seq_len - 1);
             for (int t = 0; t < model.cfg.seq_len; t++) {
                 tokens[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t]);
