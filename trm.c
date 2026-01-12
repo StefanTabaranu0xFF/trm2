@@ -55,6 +55,29 @@ typedef struct {
     float *x_norm; // normalized x (seq_len x hidden)
 } BlockCache;
 
+static BlockCache alloc_block_cache(int seq_len, int hidden_size) {
+    BlockCache cache = {
+        .x = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size),
+        .u = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size * 2),
+        .swish = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size),
+        .v = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size),
+        .y = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size),
+        .rms_norm = malloc(sizeof(float) * (size_t)seq_len),
+        .x_norm = malloc(sizeof(float) * (size_t)seq_len * (size_t)hidden_size),
+    };
+    return cache;
+}
+
+static void free_block_cache(BlockCache *cache) {
+    free(cache->x);
+    free(cache->u);
+    free(cache->swish);
+    free(cache->v);
+    free(cache->y);
+    free(cache->rms_norm);
+    free(cache->x_norm);
+}
+
 static float randf() {
     return (float)rand() / (float)RAND_MAX - 0.5f;
 }
@@ -695,24 +718,8 @@ static void generate(Model *model, const char *vocab, const char *prompt, int st
     float *z_l = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size);
     float *input_embed = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size);
 
-    BlockCache l_cache = {
-        .x = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .u = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size * 2),
-        .swish = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .v = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .y = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .rms_norm = malloc(sizeof(float) * (size_t)seq_len),
-        .x_norm = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-    };
-    BlockCache h_cache = {
-        .x = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .u = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size * 2),
-        .swish = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .v = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .y = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-        .rms_norm = malloc(sizeof(float) * (size_t)seq_len),
-        .x_norm = malloc(sizeof(float) * (size_t)seq_len * (size_t)cfg.hidden_size),
-    };
+    BlockCache l_cache = alloc_block_cache(seq_len, cfg.hidden_size);
+    BlockCache h_cache = alloc_block_cache(seq_len, cfg.hidden_size);
 
     printf("\nGenerated:\n");
     for (int step = 0; step < steps; step++) {
@@ -741,20 +748,8 @@ static void generate(Model *model, const char *vocab, const char *prompt, int st
     free(z_h);
     free(z_l);
     free(input_embed);
-    free(l_cache.x);
-    free(l_cache.u);
-    free(l_cache.swish);
-    free(l_cache.v);
-    free(l_cache.y);
-    free(l_cache.rms_norm);
-    free(l_cache.x_norm);
-    free(h_cache.x);
-    free(h_cache.u);
-    free(h_cache.swish);
-    free(h_cache.v);
-    free(h_cache.y);
-    free(h_cache.rms_norm);
-    free(h_cache.x_norm);
+    free_block_cache(&l_cache);
+    free_block_cache(&h_cache);
 }
 
 int main(int argc, char **argv) {
@@ -827,24 +822,8 @@ int main(int argc, char **argv) {
     int *tokens = malloc(sizeof(int) * model.cfg.seq_len);
     int *targets = malloc(sizeof(int) * model.cfg.seq_len);
 
-    BlockCache l_cache = {
-        .x = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .u = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size * 2),
-        .swish = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .v = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .y = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .rms_norm = malloc(sizeof(float) * (size_t)model.cfg.seq_len),
-        .x_norm = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-    };
-    BlockCache h_cache = {
-        .x = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .u = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size * 2),
-        .swish = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .v = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .y = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-        .rms_norm = malloc(sizeof(float) * (size_t)model.cfg.seq_len),
-        .x_norm = malloc(sizeof(float) * (size_t)model.cfg.seq_len * (size_t)model.cfg.hidden_size),
-    };
+    BlockCache l_cache = alloc_block_cache(model.cfg.seq_len, model.cfg.hidden_size);
+    BlockCache h_cache = alloc_block_cache(model.cfg.seq_len, model.cfg.hidden_size);
 
     if (text) {
         for (int step = 0; step < train_steps; step++) {
@@ -893,19 +872,7 @@ int main(int argc, char **argv) {
     free(d_logits);
     free(tokens);
     free(targets);
-    free(l_cache.x);
-    free(l_cache.u);
-    free(l_cache.swish);
-    free(l_cache.v);
-    free(l_cache.y);
-    free(l_cache.rms_norm);
-    free(l_cache.x_norm);
-    free(h_cache.x);
-    free(h_cache.u);
-    free(h_cache.swish);
-    free(h_cache.v);
-    free(h_cache.y);
-    free(h_cache.rms_norm);
-    free(h_cache.x_norm);
+    free_block_cache(&l_cache);
+    free_block_cache(&h_cache);
     return 0;
 }
