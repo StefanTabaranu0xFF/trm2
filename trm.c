@@ -321,6 +321,73 @@ static void update_params(Model *model, float lr) {
     }
 }
 
+static void clip_gradients(Model *model, float max_norm) {
+    Config cfg = model->cfg;
+    double sum = 0.0;
+    size_t w1_size = (size_t)cfg.hidden_size * (size_t)cfg.hidden_size * 2;
+    size_t w2_size = (size_t)cfg.hidden_size * (size_t)cfg.hidden_size;
+    size_t b1_size = (size_t)cfg.hidden_size * 2;
+    size_t b2_size = (size_t)cfg.hidden_size;
+    size_t embed_size = (size_t)cfg.vocab_size * (size_t)cfg.hidden_size;
+    size_t pos_size = (size_t)cfg.seq_len * (size_t)cfg.hidden_size;
+    size_t lm_size = (size_t)cfg.hidden_size * (size_t)cfg.vocab_size;
+
+    for (size_t i = 0; i < w1_size; i++) {
+        sum += (double)model->block.gw1[i] * (double)model->block.gw1[i];
+    }
+    for (size_t i = 0; i < w2_size; i++) {
+        sum += (double)model->block.gw2[i] * (double)model->block.gw2[i];
+    }
+    for (size_t i = 0; i < b1_size; i++) {
+        sum += (double)model->block.gb1[i] * (double)model->block.gb1[i];
+    }
+    for (size_t i = 0; i < b2_size; i++) {
+        sum += (double)model->block.gb2[i] * (double)model->block.gb2[i];
+        sum += (double)model->block.grms_weight[i] * (double)model->block.grms_weight[i];
+        sum += (double)model->g_h_init[i] * (double)model->g_h_init[i];
+        sum += (double)model->g_l_init[i] * (double)model->g_l_init[i];
+    }
+    for (size_t i = 0; i < embed_size; i++) {
+        sum += (double)model->g_token_embed[i] * (double)model->g_token_embed[i];
+    }
+    for (size_t i = 0; i < pos_size; i++) {
+        sum += (double)model->g_pos_embed[i] * (double)model->g_pos_embed[i];
+    }
+    for (size_t i = 0; i < lm_size; i++) {
+        sum += (double)model->g_lm_head[i] * (double)model->g_lm_head[i];
+    }
+
+    double norm = sqrt(sum);
+    if (norm <= (double)max_norm || norm == 0.0) {
+        return;
+    }
+    double scale = (double)max_norm / norm;
+    for (size_t i = 0; i < w1_size; i++) {
+        model->block.gw1[i] = (float)((double)model->block.gw1[i] * scale);
+    }
+    for (size_t i = 0; i < w2_size; i++) {
+        model->block.gw2[i] = (float)((double)model->block.gw2[i] * scale);
+    }
+    for (size_t i = 0; i < b1_size; i++) {
+        model->block.gb1[i] = (float)((double)model->block.gb1[i] * scale);
+    }
+    for (size_t i = 0; i < b2_size; i++) {
+        model->block.gb2[i] = (float)((double)model->block.gb2[i] * scale);
+        model->block.grms_weight[i] = (float)((double)model->block.grms_weight[i] * scale);
+        model->g_h_init[i] = (float)((double)model->g_h_init[i] * scale);
+        model->g_l_init[i] = (float)((double)model->g_l_init[i] * scale);
+    }
+    for (size_t i = 0; i < embed_size; i++) {
+        model->g_token_embed[i] = (float)((double)model->g_token_embed[i] * scale);
+    }
+    for (size_t i = 0; i < pos_size; i++) {
+        model->g_pos_embed[i] = (float)((double)model->g_pos_embed[i] * scale);
+    }
+    for (size_t i = 0; i < lm_size; i++) {
+        model->g_lm_head[i] = (float)((double)model->g_lm_head[i] * scale);
+    }
+}
+
 static int save_model(const char *path, const Model *model, const char *vocab) {
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -738,7 +805,7 @@ int main(int argc, char **argv) {
     };
 
     if (text) {
-        float lr = 0.01f;
+        float lr = 0.005f;
         for (int step = 0; step < train_steps; step++) {
             int start = rand() % (int)(len - model.cfg.seq_len - 1);
             for (int t = 0; t < model.cfg.seq_len; t++) {
@@ -749,7 +816,12 @@ int main(int argc, char **argv) {
             forward(&model, tokens, logits, z_h, z_l, &l_cache, &h_cache, input_embed);
             float loss = softmax_loss(logits, targets, model.cfg.seq_len, model.cfg.vocab_size, d_logits);
             backward(&model, tokens, d_logits, z_h, z_l, &l_cache, &h_cache);
+            clip_gradients(&model, 1.0f);
             update_params(&model, lr);
+            if (!isfinite(loss)) {
+                printf("Loss diverged (nan/inf). Stopping early.\n");
+                break;
+            }
             if (step % 50 == 0) {
                 printf("Step %d loss %.4f\n", step, loss);
             }
