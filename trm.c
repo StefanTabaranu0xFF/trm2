@@ -388,6 +388,42 @@ static void clip_gradients(Model *model, float max_norm) {
     }
 }
 
+static void scale_gradients(Model *model, float scale) {
+    Config cfg = model->cfg;
+    size_t w1_size = (size_t)cfg.hidden_size * (size_t)cfg.hidden_size * 2;
+    size_t w2_size = (size_t)cfg.hidden_size * (size_t)cfg.hidden_size;
+    size_t b1_size = (size_t)cfg.hidden_size * 2;
+    size_t b2_size = (size_t)cfg.hidden_size;
+    size_t embed_size = (size_t)cfg.vocab_size * (size_t)cfg.hidden_size;
+    size_t pos_size = (size_t)cfg.seq_len * (size_t)cfg.hidden_size;
+    size_t lm_size = (size_t)cfg.hidden_size * (size_t)cfg.vocab_size;
+
+    for (size_t i = 0; i < w1_size; i++) {
+        model->block.gw1[i] *= scale;
+    }
+    for (size_t i = 0; i < w2_size; i++) {
+        model->block.gw2[i] *= scale;
+    }
+    for (size_t i = 0; i < b1_size; i++) {
+        model->block.gb1[i] *= scale;
+    }
+    for (size_t i = 0; i < b2_size; i++) {
+        model->block.gb2[i] *= scale;
+        model->block.grms_weight[i] *= scale;
+        model->g_h_init[i] *= scale;
+        model->g_l_init[i] *= scale;
+    }
+    for (size_t i = 0; i < embed_size; i++) {
+        model->g_token_embed[i] *= scale;
+    }
+    for (size_t i = 0; i < pos_size; i++) {
+        model->g_pos_embed[i] *= scale;
+    }
+    for (size_t i = 0; i < lm_size; i++) {
+        model->g_lm_head[i] *= scale;
+    }
+}
+
 static int save_model(const char *path, const Model *model, const char *vocab) {
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -723,7 +759,7 @@ static void generate(Model *model, const char *vocab, const char *prompt, int st
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Usage: %s <text_file> [--save path] [--load path] [--generate N] [--prompt text] [--steps N]\n",
+        printf("Usage: %s <text_file> [--save path] [--load path] [--generate N] [--prompt text] [--steps N] [--batch N] [--lr F]\n",
                argv[0]);
         return 1;
     }
@@ -733,6 +769,8 @@ int main(int argc, char **argv) {
     srand(0);
     int generate_steps = 200;
     int train_steps = 500;
+    int batch_size = 4;
+    float lr = 0.005f;
     const char *prompt = "Hello";
     const char *save_path = NULL;
     const char *load_path = NULL;
@@ -748,6 +786,10 @@ int main(int argc, char **argv) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             train_steps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batch_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--lr") == 0 && i + 1 < argc) {
+            lr = (float)atof(argv[++i]);
         }
     }
 
@@ -805,25 +847,30 @@ int main(int argc, char **argv) {
     };
 
     if (text) {
-        float lr = 0.005f;
         for (int step = 0; step < train_steps; step++) {
-            int start = rand() % (int)(len - model.cfg.seq_len - 1);
-            for (int t = 0; t < model.cfg.seq_len; t++) {
-                tokens[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t]);
-                targets[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t + 1]);
-            }
             zero_grad(&model);
-            forward(&model, tokens, logits, z_h, z_l, &l_cache, &h_cache, input_embed);
-            float loss = softmax_loss(logits, targets, model.cfg.seq_len, model.cfg.vocab_size, d_logits);
-            backward(&model, tokens, d_logits, z_h, z_l, &l_cache, &h_cache);
+            float batch_loss = 0.0f;
+            for (int batch = 0; batch < batch_size; batch++) {
+                int start = rand() % (int)(len - model.cfg.seq_len - 1);
+                for (int t = 0; t < model.cfg.seq_len; t++) {
+                    tokens[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t]);
+                    targets[t] = char_to_id(vocab, model.cfg.vocab_size, text[start + t + 1]);
+                }
+                forward(&model, tokens, logits, z_h, z_l, &l_cache, &h_cache, input_embed);
+                float loss = softmax_loss(logits, targets, model.cfg.seq_len, model.cfg.vocab_size, d_logits);
+                backward(&model, tokens, d_logits, z_h, z_l, &l_cache, &h_cache);
+                batch_loss += loss;
+            }
+            scale_gradients(&model, 1.0f / (float)batch_size);
             clip_gradients(&model, 1.0f);
             update_params(&model, lr);
-            if (!isfinite(loss)) {
+            float avg_loss = batch_loss / (float)batch_size;
+            if (!isfinite(avg_loss)) {
                 printf("Loss diverged (nan/inf). Stopping early.\n");
                 break;
             }
             if (step % 50 == 0) {
-                printf("Step %d loss %.4f\n", step, loss);
+                printf("Step %d loss %.4f\n", step, avg_loss);
             }
         }
     }
