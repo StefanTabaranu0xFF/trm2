@@ -3,7 +3,7 @@
 ## Fetch Binance candle data
 
 ```bash
-python3 scripts/fetch_binance_ohlcv.py --symbol BTCUSDT --interval 1h --limit 1000 --output binance_ohlcv.csv
+python3 scripts/fetch_binance_ohlcv.py --symbol BTCUSDT --interval 1h --total 5000 --output binance_ohlcv.csv
 ```
 
 ## Train on real OHLCV CSV
