@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra -std=c11
-SRC = src/main.c src/model.c src/attention.c src/gemm.c
+CFLAGS = -O3 -Wall -Wextra -std=c11 -ffast-math
+SRC = src/main.c src/gemm.c
 
 all: trm
 
