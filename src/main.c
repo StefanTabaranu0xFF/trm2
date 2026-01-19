@@ -137,6 +137,9 @@ typedef struct {
     // [7] bias 1
     float x[8];
     int y; // 0=SELL, 1=HOLD, 2=BUY
+    double entry_price;
+    double horizon_price;
+    double horizon_pct;
 } Sample;
 
 static double mean(const double *a, int n) {
@@ -226,6 +229,9 @@ static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double
         out[idx].x[6] = (float)rsi_scaled;
         out[idx].x[7] = 1.0f;
         out[idx].y = y;
+        out[idx].entry_price = bars[i].c;
+        out[idx].horizon_price = bars[i + horizon].c;
+        out[idx].horizon_pct = fut * 100.0;
         idx++;
     }
 
@@ -485,6 +491,15 @@ static double eval_accuracy(const Model *m, const Sample *S, int n, int K) {
     return (double)correct / (double)n;
 }
 
+static const char *label_name(int y) {
+    switch (y) {
+        case 0: return "SELL";
+        case 1: return "HOLD";
+        case 2: return "BUY";
+        default: return "UNK";
+    }
+}
+
 static void evaluate_model(const Model *m, const Sample *S, int n, int K) {
     int conf[3][3] = {0};
     Cache cache;
@@ -659,14 +674,20 @@ int main(int argc, char **argv) {
     }
 
     // 6) show a few predictions
-    printf("\nSample predictions (0=SELL,1=HOLD,2=BUY):\n");
+    printf("\nSample predictions:\n");
     for (int i = 0; i < 10 && i < nTest; i++) {
         Cache cache;
         float logits[3], p[3];
         forward(&m, testS[i].x, K, logits, &cache);
         softmax3(logits, p);
         int pred = argmax3(p);
-        printf("y=%d pred=%d probs=[%.2f %.2f %.2f]\n", testS[i].y, pred, p[0], p[1], p[2]);
+        printf("label=%s entry=%.2f horizon=%.2f (%+.2f%%) pred=%s probs=[%.2f %.2f %.2f]\n",
+               label_name(testS[i].y),
+               testS[i].entry_price,
+               testS[i].horizon_price,
+               testS[i].horizon_pct,
+               label_name(pred),
+               p[0], p[1], p[2]);
     }
 
     free(samples);
