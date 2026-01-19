@@ -8,7 +8,9 @@ python3 scripts/fetch_binance_ohlcv.py --symbol BTCUSDT --interval 1h --limit 10
 
 ## Train on real OHLCV CSV
 
+Second argument is the number of MLP layers on top of the recursive block (0-4).
+
 ```bash
 make
-./trm binance_ohlcv.csv
+./trm binance_ohlcv.csv 2
 ```
