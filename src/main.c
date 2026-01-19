@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <errno.h>
 #include <string.h>
 
 #ifndef M_PI
@@ -511,6 +512,140 @@ static void gen_dataset(Sample *dst, int n_samples, int seed_offset) {
     free(p);
 }
 
+static int load_prices_from_csv(const char *path, float **out_prices, int *out_count) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to open %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+
+    size_t cap = 1024;
+    size_t count = 0;
+    float *prices = (float *)malloc(sizeof(float) * cap);
+    if (!prices) {
+        fprintf(stderr, "alloc failed\n");
+        fclose(fp);
+        return 0;
+    }
+
+    char line[512];
+    if (!fgets(line, sizeof(line), fp)) {
+        fprintf(stderr, "Empty CSV file: %s\n", path);
+        free(prices);
+        fclose(fp);
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *token = NULL;
+        int col = 0;
+        float close = 0.0f;
+
+        token = strtok(line, ",");
+        while (token) {
+            if (col == 4) {
+                close = (float)strtod(token, NULL);
+                break;
+            }
+            token = strtok(NULL, ",");
+            col++;
+        }
+
+        if (col < 4) {
+            continue;
+        }
+        if (count >= cap) {
+            cap *= 2;
+            float *tmp = (float *)realloc(prices, sizeof(float) * cap);
+            if (!tmp) {
+                fprintf(stderr, "alloc failed\n");
+                free(prices);
+                fclose(fp);
+                return 0;
+            }
+            prices = tmp;
+        }
+        prices[count++] = close;
+    }
+
+    fclose(fp);
+    if (count == 0) {
+        fprintf(stderr, "No rows parsed from %s\n", path);
+        free(prices);
+        return 0;
+    }
+
+    *out_prices = prices;
+    *out_count = (int)count;
+    return 1;
+}
+
+static int build_dataset_from_prices(
+    const float *prices,
+    int price_count,
+    Sample **out_train,
+    int *out_train_count,
+    Sample **out_test,
+    int *out_test_count
+) {
+    const int lookback = 16;
+    const int horizon = 8;
+    const float thr = 0.006f;
+    float *scaled = NULL;
+
+    int max_samples = price_count - lookback - horizon;
+    if (max_samples <= 0) {
+        fprintf(stderr, "Not enough data to build samples.\n");
+        return 0;
+    }
+
+    int train_count = (int)(max_samples * 0.8f);
+    int test_count = max_samples - train_count;
+    if (train_count < BATCH || test_count < 1) {
+        fprintf(stderr, "Not enough samples for train/test split.\n");
+        return 0;
+    }
+
+    Sample *train = (Sample *)malloc(sizeof(Sample) * train_count);
+    Sample *test = (Sample *)malloc(sizeof(Sample) * test_count);
+    scaled = (float *)malloc(sizeof(float) * price_count);
+    if (!train || !test || !scaled) {
+        fprintf(stderr, "alloc failed\n");
+        free(train);
+        free(test);
+        free(scaled);
+        return 0;
+    }
+
+    float base = prices[0];
+    if (base == 0.0f) base = 1.0f;
+    for (int i = 0; i < price_count; i++) {
+        scaled[i] = (prices[i] / base) * 100.0f;
+    }
+
+    for (int i = 0; i < max_samples; i++) {
+        int t = i + lookback;
+        Sample *dst = (i < train_count) ? &train[i] : &test[i - train_count];
+        make_features_from_series(scaled, t, dst->x);
+
+        float future = scaled[t + horizon];
+        float cur = scaled[t];
+        float fut_ret = (future - cur) / fmaxf(cur, 1e-6f);
+
+        int y = CLS_WAIT;
+        if (fut_ret > thr) y = CLS_LONG;
+        else if (fut_ret < -thr) y = CLS_SHORT;
+        dst->y = y;
+    }
+
+    *out_train = train;
+    *out_train_count = train_count;
+    *out_test = test;
+    *out_test_count = test_count;
+    free(scaled);
+    return 1;
+}
+
 // ------------------------- TRM forward (no grad) -------------------------
 
 static void vec_zero(float v[D]) { for (int i = 0; i < D; i++) v[i] = 0.0f; }
@@ -659,15 +794,54 @@ static float eval_accuracy(const Net *net, const Heads *heads, const Sample *dat
     return (float)correct / (float)n;
 }
 
-int main(void) {
+static void print_label_stats(const Sample *data, int n, const char *label) {
+    int counts[3] = {0, 0, 0};
+    for (int i = 0; i < n; i++) {
+        int y = data[i].y;
+        if (y >= 0 && y < 3) counts[y]++;
+    }
+    printf("%s label distribution: SHORT=%d WAIT=%d LONG=%d\n",
+           label, counts[CLS_SHORT], counts[CLS_WAIT], counts[CLS_LONG]);
+}
+
+int main(int argc, char **argv) {
     printf("Toy TRM (C) - candle mock classification: SHORT/WAIT/LONG\n");
 
-    Sample *train = (Sample*)malloc(sizeof(Sample) * TRAIN_SAMPLES);
-    Sample *test  = (Sample*)malloc(sizeof(Sample) * TEST_SAMPLES);
-    if (!train || !test) { fprintf(stderr, "alloc failed\n"); return 1; }
+    const char *csv_path = NULL;
+    if (argc >= 2) {
+        csv_path = argv[1];
+    }
 
-    gen_dataset(train, TRAIN_SAMPLES, 1);
-    gen_dataset(test,  TEST_SAMPLES,  2);
+    Sample *train = NULL;
+    Sample *test = NULL;
+    int train_count = 0;
+    int test_count = 0;
+    float *prices = NULL;
+    int price_count = 0;
+
+    if (csv_path) {
+        if (!load_prices_from_csv(csv_path, &prices, &price_count)) {
+            return 1;
+        }
+        if (!build_dataset_from_prices(
+                prices, price_count, &train, &train_count, &test, &test_count)) {
+            free(prices);
+            return 1;
+        }
+        printf("Loaded %d prices from %s (train=%d, test=%d)\n",
+               price_count, csv_path, train_count, test_count);
+        print_label_stats(train, train_count, "Train");
+        print_label_stats(test, test_count, "Test");
+    } else {
+        train = (Sample*)malloc(sizeof(Sample) * TRAIN_SAMPLES);
+        test  = (Sample*)malloc(sizeof(Sample) * TEST_SAMPLES);
+        if (!train || !test) { fprintf(stderr, "alloc failed\n"); return 1; }
+
+        gen_dataset(train, TRAIN_SAMPLES, 1);
+        gen_dataset(test,  TEST_SAMPLES,  2);
+        train_count = TRAIN_SAMPLES;
+        test_count = TEST_SAMPLES;
+    }
 
     Net net;
     Heads heads;
@@ -675,14 +849,14 @@ int main(void) {
     heads_init(&heads, 0.02f);
 
     // training
-    int steps_per_epoch = TRAIN_SAMPLES / BATCH;
+    int steps_per_epoch = train_count / BATCH;
 
     for (int epoch = 1; epoch <= EPOCHS; epoch++) {
         float epoch_loss = 0.0f;
 
         // simple shuffle
-        for (int i = 0; i < TRAIN_SAMPLES; i++) {
-            int j = (int)(frand_uniform() * TRAIN_SAMPLES);
+        for (int i = 0; i < train_count; i++) {
+            int j = (int)(frand_uniform() * train_count);
             Sample tmp = train[i];
             train[i] = train[j];
             train[j] = tmp;
@@ -764,8 +938,9 @@ int main(void) {
 
         epoch_loss /= (float)steps_per_epoch;
 
-        float acc_train = eval_accuracy(&net, &heads, train, 500); // quick probe
-        float acc_test  = eval_accuracy(&net, &heads, test, TEST_SAMPLES);
+        int train_probe = (train_count < 500) ? train_count : 500;
+        float acc_train = eval_accuracy(&net, &heads, train, train_probe); // quick probe
+        float acc_test  = eval_accuracy(&net, &heads, test, test_count);
 
         printf("Epoch %2d | loss=%.4f | train_acc~%.3f | test_acc=%.3f\n",
                epoch, epoch_loss, acc_train, acc_test);
@@ -773,5 +948,6 @@ int main(void) {
 
     free(train);
     free(test);
+    free(prices);
     return 0;
 }
