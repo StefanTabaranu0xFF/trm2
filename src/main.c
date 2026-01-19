@@ -1,10 +1,9 @@
-// trm_mock_trading.c
-// Build:   gcc -O2 -std=c11 trm_mock_trading.c -lm -o trm_mock_trading
-// Run:     ./trm_mock_trading
+// trm_trading.c
+// Build:   gcc -O2 -std=c11 trm_trading.c -lm -o trm_trading
+// Run:     ./trm_trading [ohlcv_csv]
 //
-// Produces:
-// - mock_ohlcv.csv : generated mock features + label (SELL/HOLD/BUY)
-// - trains a tiny "recursive" model (TRM-like) to predict buy/sell/hold
+// Trains a tiny "recursive" model (TRM-like) to predict buy/sell/hold
+// using real OHLCV data from a CSV file (see scripts/fetch_binance_ohlcv.py).
 //
 // Notes:
 // - Uses tanh activation (more stable than ReLU for recursion)
@@ -16,10 +15,6 @@
 #include <math.h>
 #include <string.h>
 #include <limits.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 // ---------- utils ----------
 static unsigned int g_rng = 123456789u;
@@ -35,14 +30,6 @@ static inline unsigned int xorshift32(void) {
 
 static inline double urand01(void) {
     return (xorshift32() / (double)UINT_MAX);
-}
-
-// Box-Muller for standard normal
-static double randn(void) {
-    double u1 = urand01();
-    double u2 = urand01();
-    if (u1 < 1e-12) u1 = 1e-12;
-    return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 
 static inline double clip(double x, double lo, double hi) {
@@ -77,53 +64,62 @@ static int argmax3(const double p[3]) {
     return a;
 }
 
-// ---------- mock market data ----------
 typedef struct {
     double o, h, l, c, v;
 } Bar;
 
-static void generate_mock_ohlcv(Bar *bars, int n, double start_price) {
-    // random walk with regime-switching volatility + small drift bursts
-    double price = start_price;
-    double vol = 0.002;     // base vol
-    double drift = 0.0;
-
-    for (int i = 0; i < n; i++) {
-        // occasionally switch regime
-        if (i % 200 == 0 && i > 0) {
-            double r = urand01();
-            if (r < 0.33) { vol = 0.0015; drift = 0.0002; }
-            else if (r < 0.66) { vol = 0.0035; drift = -0.00015; }
-            else { vol = 0.0025; drift = 0.0; }
-        }
-
-        double ret = drift + vol * randn();
-        double close = price * (1.0 + ret);
-
-        // open is previous close with small gap
-        double open = price * (1.0 + 0.0004 * randn());
-
-        // high/low around open/close
-        double hi_base = fmax(open, close);
-        double lo_base = fmin(open, close);
-        double range = fabs(ret) * 0.8 + vol * 1.2;
-        double high = hi_base * (1.0 + fabs(range) * (0.6 + 0.6 * urand01()));
-        double low  = lo_base * (1.0 - fabs(range) * (0.6 + 0.6 * urand01()));
-
-        // volume correlated with volatility
-        double volume = 1000.0 * (1.0 + 30.0 * fabs(ret)) * (0.8 + 0.6 * urand01());
-
-        if (low > high) { double t = low; low = high; high = t; }
-        low = fmax(low, 1e-6);
-
-        bars[i].o = open;
-        bars[i].h = high;
-        bars[i].l = low;
-        bars[i].c = close;
-        bars[i].v = volume;
-
-        price = close;
+static int parse_csv_doubles(const char *line, double *vals, int max_vals) {
+    const char *p = line;
+    int n = 0;
+    while (n < max_vals) {
+        char *end = NULL;
+        double v = strtod(p, &end);
+        if (end == p) break;
+        vals[n++] = v;
+        p = end;
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
     }
+    return n;
+}
+
+static int load_ohlcv_csv(const char *path, Bar **out_bars) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    size_t cap = 4096;
+    size_t n = 0;
+    Bar *bars = (Bar*)calloc(cap, sizeof(Bar));
+    if (!bars) {
+        fclose(f);
+        return 0;
+    }
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        double vals[6];
+        int nvals = parse_csv_doubles(line, vals, 6);
+        if (nvals < 6) continue;
+        if (n >= cap) {
+            cap *= 2;
+            Bar *tmp = (Bar*)realloc(bars, cap * sizeof(Bar));
+            if (!tmp) {
+                free(bars);
+                fclose(f);
+                return 0;
+            }
+            bars = tmp;
+        }
+        bars[n].o = vals[1];
+        bars[n].h = vals[2];
+        bars[n].l = vals[3];
+        bars[n].c = vals[4];
+        bars[n].v = vals[5];
+        n++;
+    }
+    fclose(f);
+
+    *out_bars = bars;
+    return (int)n;
 }
 
 // ---------- features ----------
@@ -236,7 +232,7 @@ static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double
 }
 
 // ---------- tiny recursive model (TRM-like) ----------
-#define IN_DIM 128
+#define IN_DIM 8
 #define H_DIM 96
 #define OUT_DIM 3
 #define MAX_K 63
@@ -419,36 +415,26 @@ static double eval_accuracy(const Model *m, const Sample *S, int n, int K) {
 }
 
 // ---------- main ----------
-int main(void) {
-    // 1) generate bars
-    const int N_BARS = 14000;
-    Bar *bars = (Bar*)calloc((size_t)N_BARS, sizeof(Bar));
-    generate_mock_ohlcv(bars, N_BARS, 100.0);
+int main(int argc, char **argv) {
+    const char *csv_path = (argc > 1) ? argv[1] : "binance_ohlcv.csv";
+    Bar *bars = NULL;
+    int nBars = load_ohlcv_csv(csv_path, &bars);
+    if (nBars <= 0) {
+        fprintf(stderr, "Failed to load OHLCV data from %s\n", csv_path);
+        return 1;
+    }
+    printf("Loaded %d bars from %s\n", nBars, csv_path);
 
     // 2) samples
     const int HORIZON = 8;      // label based on close at t+8
     const double THR = 0.004;   // +/-0.4% threshold for BUY/SELL (try 0.002 if HOLD dominates)
-    Sample *samples = (Sample*)calloc((size_t)N_BARS, sizeof(Sample));
-    int nS = make_samples(bars, N_BARS, samples, HORIZON, THR);
+    Sample *samples = (Sample*)calloc((size_t)nBars, sizeof(Sample));
+    int nS = make_samples(bars, nBars, samples, HORIZON, THR);
 
     // label distribution
     int cnt[3] = {0, 0, 0};
     for (int i = 0; i < nS; i++) cnt[samples[i].y]++;
     printf("Samples=%d | Label dist: SELL=%d HOLD=%d BUY=%d\n", nS, cnt[0], cnt[1], cnt[2]);
-
-    // dump CSV
-    FILE *f = fopen("mock_ohlcv.csv", "wb");
-    if (f) {
-        fprintf(f, "ret1,ret5,888888dfg8888asdasdmom10,vol10,range_pct,vol_norm,rsi_scaled,bias,label\n");
-        for (int i = 0; i < nS; i++) {
-            for (int j = 0; j < IN_DIM; j++) fprintf(f, "%.2f,", samples[i].x[j]);
-            fprintf(f, "%d\n", samples[i].y);
-        }
-        fclose(f);
-        printf("Wrote mock_ohlcv.csv\n");
-    } else {
-        printf("Could not write mock_ohlcv.csv\n");
-    }
 
     // 3) split train/test (time-based)
     int nTrain = (int)(nS * 0.8);
