@@ -137,6 +137,9 @@ typedef struct {
     // [7] bias 1
     float x[8];
     int y; // 0=SELL, 1=HOLD, 2=BUY
+    double entry_price;
+    double horizon_price;
+    double horizon_pct;
 } Sample;
 
 static double mean(const double *a, int n) {
@@ -226,6 +229,9 @@ static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double
         out[idx].x[6] = (float)rsi_scaled;
         out[idx].x[7] = 1.0f;
         out[idx].y = y;
+        out[idx].entry_price = bars[i].c;
+        out[idx].horizon_price = bars[i + horizon].c;
+        out[idx].horizon_pct = fut * 100.0;
         idx++;
     }
 
