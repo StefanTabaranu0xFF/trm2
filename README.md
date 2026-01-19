@@ -9,8 +9,10 @@ python3 scripts/fetch_binance_ohlcv.py --symbol BTCUSDT --interval 1h --total 50
 ## Train on real OHLCV CSV
 
 Second argument is the number of MLP layers on top of the recursive block (0-4).
+Use `--save` to write model weights and `--load` to resume from a saved model.
 
 ```bash
 make
-./trm binance_ohlcv.csv 2
+./trm binance_ohlcv.csv 2 --save model.bin
+./trm binance_ohlcv.csv 2 --load model.bin --save model.bin
 ```

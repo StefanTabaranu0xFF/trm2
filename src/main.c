@@ -1,6 +1,6 @@
 // trm_trading.c
 // Build:   gcc -O2 -std=c11 trm_trading.c -lm -o trm_trading
-// Run:     ./trm_trading [ohlcv_csv] [mlp_layers]
+// Run:     ./trm_trading [ohlcv_csv] [mlp_layers] [--load model.bin] [--save model.bin]
 //
 // Trains a tiny "recursive" model (TRM-like) to predict buy/sell/hold
 // using real OHLCV data from a CSV file (see scripts/fetch_binance_ohlcv.py).
@@ -265,6 +265,12 @@ typedef struct {
     int mlp_layers;
 } Cache;
 
+typedef struct {
+    char magic[4];
+    int version;
+    int model_bytes;
+} ModelHeader;
+
 static float frand(float scale) {
     return (float)((urand01() * 2.0 - 1.0) * scale);
 }
@@ -500,10 +506,76 @@ static void evaluate_model(const Model *m, const Sample *S, int n, int K) {
     printf("Accuracy: %.3f\n", (double)correct / (double)n);
 }
 
+static int save_model(const char *path, const Model *m) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return 0;
+    }
+    ModelHeader header = { {'T', 'R', 'M', '1'}, 1, (int)sizeof(Model) };
+    if (fwrite(&header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    if (fwrite(m, sizeof(Model), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+static int load_model(const char *path, Model *m) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return 0;
+    }
+    ModelHeader header;
+    if (fread(&header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    if (memcmp(header.magic, "TRM1", 4) != 0 || header.version != 1 ||
+        header.model_bytes != (int)sizeof(Model)) {
+        fclose(f);
+        return 0;
+    }
+    if (fread(m, sizeof(Model), 1, f) != 1) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
 // ---------- main ----------
 int main(int argc, char **argv) {
-    const char *csv_path = (argc > 1) ? argv[1] : "binance_ohlcv.csv";
-    int mlp_layers = (argc > 2) ? atoi(argv[2]) : 1;
+    const char *csv_path = "binance_ohlcv.csv";
+    int mlp_layers = 1;
+    const char *save_path = NULL;
+    const char *load_path = NULL;
+
+    int positional = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
+            save_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
+            load_path = argv[++i];
+            continue;
+        }
+        if (argv[i][0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        }
+        if (positional == 0) {
+            csv_path = argv[i];
+            positional++;
+        } else if (positional == 1) {
+            mlp_layers = atoi(argv[i]);
+            positional++;
+        }
+    }
     if (mlp_layers < 0) mlp_layers = 0;
     if (mlp_layers > MAX_MLP_LAYERS) mlp_layers = MAX_MLP_LAYERS;
 
@@ -534,7 +606,16 @@ int main(int argc, char **argv) {
 
     // 4) init model
     Model m;
-    model_init(&m, mlp_layers);
+    if (load_path) {
+        if (!load_model(load_path, &m)) {
+            fprintf(stderr, "Failed to load model from %s\n", load_path);
+            return 1;
+        }
+        mlp_layers = m.mlp_layers;
+        printf("Loaded model from %s (mlp_layers=%d)\n", load_path, mlp_layers);
+    } else {
+        model_init(&m, mlp_layers);
+    }
 
     // 5) train
     const int K = 4;            // start with 4 (stable), try 8 later
@@ -554,6 +635,15 @@ int main(int argc, char **argv) {
     }
 
     evaluate_model(&m, testS, nTest, K);
+
+    if (save_path) {
+        if (save_model(save_path, &m)) {
+            printf("Saved model to %s\n", save_path);
+        } else {
+            fprintf(stderr, "Failed to save model to %s\n", save_path);
+            return 1;
+        }
+    }
 
     // 6) show a few predictions
     printf("\nSample predictions (0=SELL,1=HOLD,2=BUY):\n");
