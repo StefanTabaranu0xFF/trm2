@@ -622,6 +622,8 @@ int main(int argc, char **argv) {
         model_init(&m, mlp_layers);
     }
 
+    const int K = 4;            // start with 4 (stable), try 8 later
+
     if (eval_only) {
         evaluate_model(&m, testS, nTest, K);
         free(samples);
@@ -630,7 +632,6 @@ int main(int argc, char **argv) {
     }
 
     // 5) train
-    const int K = 4;            // start with 4 (stable), try 8 later
     const int EPOCHS = 200;
     double lr = 0.001;
 
