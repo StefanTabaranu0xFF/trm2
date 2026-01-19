@@ -234,8 +234,8 @@ static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double
 }
 
 // ---------- tiny recursive model (TRM-like) ----------
-#define IN_DIM 8
-#define H_DIM 96
+#define IN_DIM 64
+#define H_DIM 192
 #define OUT_DIM 3
 #define MAX_K 63
 #define MAX_MLP_LAYERS 4
@@ -632,8 +632,8 @@ int main(int argc, char **argv) {
     }
 
     // 5) train
-    const int EPOCHS = 200;
-    double lr = 0.001;
+    const int EPOCHS = 100;
+    double lr = 0.01;
 
     for (int e = 1; e <= EPOCHS; e++) {
         double loss_sum = 0.0;
