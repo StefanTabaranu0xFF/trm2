@@ -1,6 +1,6 @@
 // trm_trading.c
 // Build:   gcc -O2 -std=c11 trm_trading.c -lm -o trm_trading
-// Run:     ./trm_trading [ohlcv_csv] [mlp_layers] [--load model.bin] [--save model.bin]
+// Run:     ./trm_trading [ohlcv_csv] [mlp_layers] [--load model.bin] [--save model.bin] [--eval]
 //
 // Trains a tiny "recursive" model (TRM-like) to predict buy/sell/hold
 // using real OHLCV data from a CSV file (see scripts/fetch_binance_ohlcv.py).
@@ -553,6 +553,7 @@ int main(int argc, char **argv) {
     int mlp_layers = 1;
     const char *save_path = NULL;
     const char *load_path = NULL;
+    int eval_only = 0;
 
     int positional = 0;
     for (int i = 1; i < argc; i++) {
@@ -562,6 +563,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
             load_path = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--eval") == 0) {
+            eval_only = 1;
             continue;
         }
         if (argv[i][0] == '-') {
@@ -615,6 +620,13 @@ int main(int argc, char **argv) {
         printf("Loaded model from %s (mlp_layers=%d)\n", load_path, mlp_layers);
     } else {
         model_init(&m, mlp_layers);
+    }
+
+    if (eval_only) {
+        evaluate_model(&m, testS, nTest, K);
+        free(samples);
+        free(bars);
+        return 0;
     }
 
     // 5) train
