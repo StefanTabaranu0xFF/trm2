@@ -137,6 +137,8 @@ typedef struct {
     // [7] bias 1
     float x[8];
     int y; // 0=SELL, 1=HOLD, 2=BUY
+    double entry_price;
+    double label_price;
 } Sample;
 
 static double mean(const double *a, int n) {
@@ -211,7 +213,9 @@ static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double
         double rsi = rsi14(bars, i);
         double rsi_scaled = (rsi - 50.0) / 50.0; // [-1..+1]
 
-        double fut = (bars[i + horizon].c / bars[i].c) - 1.0;
+        double entry_price = bars[i].c;
+        double label_price = bars[i + horizon].c;
+        double fut = (label_price / entry_price) - 1.0;
         int y = 1; // HOLD
         if (fut >= thr) y = 2;       // BUY
         else if (fut <= -thr) y = 0; // SELL
@@ -226,6 +230,8 @@ static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double
         out[idx].x[6] = (float)rsi_scaled;
         out[idx].x[7] = 1.0f;
         out[idx].y = y;
+        out[idx].entry_price = entry_price;
+        out[idx].label_price = label_price;
         idx++;
     }
 
