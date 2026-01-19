@@ -125,8 +125,12 @@ static int load_ohlcv_csv(const char *path, Bar **out_bars) {
 }
 
 // ---------- features ----------
+#define FEAT_PER_STEP 8
+#define HISTORY_STEPS 4
+#define IN_DIM (FEAT_PER_STEP * HISTORY_STEPS)
+
 typedef struct {
-    // 8 features per sample
+    // 8 features per timestep, stacked for HISTORY_STEPS
     // [0] ret1 scaled
     // [1] ret5 scaled
     // [2] mom10 (close/sma10 - 1) scaled
@@ -135,7 +139,7 @@ typedef struct {
     // [5] vol_norm (v/ema_v - 1) scaled
     // [6] rsi_14 scaled to [-1..1]
     // [7] bias 1
-    float x[8];
+    float x[IN_DIM];
     int y; // 0=SELL, 1=HOLD, 2=BUY
 } Sample;
 
@@ -181,60 +185,68 @@ static double rsi14(const Bar *b, int i) {
     return rsi;
 }
 
+static void compute_features_at(const Bar *bars, const double *r1, const double *ema_v, int i, float out[FEAT_PER_STEP]) {
+    double ret1 = r1[i];
+    double ret5 = (bars[i].c / bars[i-5].c) - 1.0;
+
+    double sma10 = sma_close(bars, i, 10);
+    double mom10 = (bars[i].c / sma10) - 1.0;
+
+    double window_r[10];
+    for (int k = 0; k < 10; k++) window_r[k] = r1[i-k];
+    double vol10 = stddev(window_r, 10);
+
+    double range_pct = (bars[i].h - bars[i].l) / bars[i].c;
+    double vol_norm = (bars[i].v / (ema_v[i] + 1e-9)) - 1.0;
+
+    double rsi = rsi14(bars, i);
+    double rsi_scaled = (rsi - 50.0) / 50.0; // [-1..+1]
+
+    // light scaling (keeps values in nicer ranges)
+    out[0] = (float)(ret1 * 50.0);
+    out[1] = (float)(ret5 * 20.0);
+    out[2] = (float)(mom10 * 30.0);
+    out[3] = (float)(vol10 * 200.0);
+    out[4] = (float)(range_pct * 50.0);
+    out[5] = (float)(vol_norm * 3.0);
+    out[6] = (float)rsi_scaled;
+    out[7] = 1.0f;
+}
+
 static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double thr) {
     // label by future return at i+horizon:
     // BUY if >= +thr, SELL if <= -thr, else HOLD
     int idx = 0;
-    double ema_v = bars[0].v;
     const double alpha_v = 2.0 / (30.0 + 1.0); // EMA ~30
 
     // precompute 1-step returns
     double *r1 = (double*)calloc((size_t)n, sizeof(double));
     for (int i = 1; i < n; i++) r1[i] = (bars[i].c / bars[i-1].c) - 1.0;
 
+    double *ema_v = (double*)calloc((size_t)n, sizeof(double));
+    ema_v[0] = bars[0].v;
+    for (int i = 1; i < n; i++) ema_v[i] = ema_update(ema_v[i-1], bars[i].v, alpha_v);
+
     for (int i = 50; i < n - horizon; i++) {
-        ema_v = ema_update(ema_v, bars[i].v, alpha_v);
-
-        double ret1 = r1[i];
-        double ret5 = (bars[i].c / bars[i-5].c) - 1.0;
-
-        double sma10 = sma_close(bars, i, 10);
-        double mom10 = (bars[i].c / sma10) - 1.0;
-
-        double window_r[10];
-        for (int k = 0; k < 10; k++) window_r[k] = r1[i-k];
-        double vol10 = stddev(window_r, 10);
-
-        double range_pct = (bars[i].h - bars[i].l) / bars[i].c;
-        double vol_norm = (bars[i].v / (ema_v + 1e-9)) - 1.0;
-
-        double rsi = rsi14(bars, i);
-        double rsi_scaled = (rsi - 50.0) / 50.0; // [-1..+1]
-
         double fut = (bars[i + horizon].c / bars[i].c) - 1.0;
         int y = 1; // HOLD
         if (fut >= thr) y = 2;       // BUY
         else if (fut <= -thr) y = 0; // SELL
 
-        // light scaling (keeps values in nicer ranges)
-        out[idx].x[0] = (float)(ret1 * 50.0);
-        out[idx].x[1] = (float)(ret5 * 20.0);
-        out[idx].x[2] = (float)(mom10 * 30.0);
-        out[idx].x[3] = (float)(vol10 * 200.0);
-        out[idx].x[4] = (float)(range_pct * 50.0);
-        out[idx].x[5] = (float)(vol_norm * 3.0);
-        out[idx].x[6] = (float)rsi_scaled;
-        out[idx].x[7] = 1.0f;
+        for (int lag = 0; lag < HISTORY_STEPS; lag++) {
+            int t = i - lag;
+            compute_features_at(bars, r1, ema_v, t, &out[idx].x[lag * FEAT_PER_STEP]);
+        }
         out[idx].y = y;
         idx++;
     }
 
     free(r1);
+    free(ema_v);
     return idx;
 }
 
 // ---------- tiny recursive model (TRM-like) ----------
-#define IN_DIM 64
 #define H_DIM 192
 #define OUT_DIM 3
 #define MAX_K 63
