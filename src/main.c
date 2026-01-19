@@ -1,675 +1,777 @@
-// trm_trading.c
-// Build:   gcc -O2 -std=c11 trm_trading.c -lm -o trm_trading
-// Run:     ./trm_trading [ohlcv_csv] [mlp_layers] [--load model.bin] [--save model.bin] [--eval]
+// trm_toy.c
+// Minimal TRM-like implementation in pure C (no external deps).
+// Task: classify candle-feature vectors into {SHORT, WAIT, LONG} using recursive latent refinement.
 //
-// Trains a tiny "recursive" model (TRM-like) to predict buy/sell/hold
-// using real OHLCV data from a CSV file (see scripts/fetch_binance_ohlcv.py).
+// Build:
+//   gcc -O2 -std=c11 -lm trm_toy.c -o trm_toy
+//
+// Run:
+//   ./trm_toy
 //
 // Notes:
-// - Uses tanh activation (more stable than ReLU for recursion)
-// - Correct gradients (uses "old" weights when computing dh for Wo/Wh)
-// - Optional class weights + grad clipping for stability
+// - This is a compact "toy" TRM. It demonstrates the algorithmic loop (z updates, then y update, deep supervision).
+// - Uses AdamW-ish optimizer (simplified).
+// - Generates mock candle data (random walk). Label from future return.
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include <limits.h>
 
-#include "gemm.h"
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-// ---------- utils ----------
-static unsigned int g_rng = 123456789u;
+// ------------------------- utils / rng -------------------------
 
-static inline unsigned int xorshift32(void) {
-    unsigned int x = g_rng;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
+static uint64_t g_rng = 0x123456789abcdef0ULL;
+
+static uint64_t xorshift64star(void) {
+    uint64_t x = g_rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
     g_rng = x;
-    return x;
+    return x * 0x2545F4914F6CDD1DULL;
 }
 
-static inline double urand01(void) {
-    return (xorshift32() / (double)UINT_MAX);
+static float frand_uniform(void) {
+    // [0,1)
+    uint32_t r = (uint32_t)(xorshift64star() >> 32);
+    return (r / 4294967296.0f);
 }
 
-static inline float clipf(float x, float lo, float hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
-    return x;
+static float frand_normal(void) {
+    // Box-Muller
+    float u1 = fmaxf(frand_uniform(), 1e-7f);
+    float u2 = frand_uniform();
+    float z0 = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+    return z0;
 }
 
-static void softmax3(const float z[3], float p[3]) {
-    float m = z[0];
-    if (z[1] > m) m = z[1];
-    if (z[2] > m) m = z[2];
-    float e0 = expf(z[0] - m);
-    float e1 = expf(z[1] - m);
-    float e2 = expf(z[2] - m);
-    float s = e0 + e1 + e2;
-    p[0] = e0 / s;
-    p[1] = e1 / s;
-    p[2] = e2 / s;
+static float clampf(float x, float lo, float hi) {
+    return (x < lo) ? lo : (x > hi) ? hi : x;
 }
 
-static inline float act(float x) { return tanhf(x); }
-static inline float dact_from_pre(float pre) {
-    float t = tanhf(pre);
-    return 1.0f - t * t;
+// ------------------------- hyperparams -------------------------
+
+enum { CLS_SHORT = 0, CLS_WAIT = 1, CLS_LONG = 2 };
+
+#define D   32        // latent dimension for x_emb, y, z
+#define F   16        // raw feature dimension from candles
+#define H   64        // hidden width of tiny MLP (2-layer)
+#define N_SUP 16      // deep supervision steps
+#define T_REC 3       // T in paper (deep recursion cycles)
+#define N_LAT 6       // n in paper (latent z updates per cycle)
+
+#define TRAIN_SAMPLES 4000
+#define TEST_SAMPLES  1000
+
+#define LR     1e-3f
+#define WD     1e-2f
+#define BETA1  0.9f
+#define BETA2  0.95f
+#define EPS    1e-8f
+
+#define EPOCHS  10
+#define BATCH   64
+
+// ------------------------- tiny MLP "net" -------------------------
+//
+// net(v_in) -> v_out of size D
+// two-layer: Linear(in_dim -> H), SiLU, Linear(H -> D)
+//
+// We'll use *one* shared net with fixed input size D by construction:
+// - x_emb, y, z are all D.
+// - z-update input: v = x_emb + y + z  (D)
+// - y-update input: v = y + z          (D)
+//
+// So net input dim = D, output dim = D.
+
+typedef struct {
+    // W1: [H, D], b1: [H]
+    float W1[H][D];
+    float b1[H];
+
+    // W2: [D, H], b2: [D]
+    float W2[D][H];
+    float b2[D];
+
+    // Adam moments
+    float mW1[H][D], vW1[H][D];
+    float mb1[H], vb1[H];
+    float mW2[D][H], vW2[D][H];
+    float mb2[D], vb2[D];
+
+    int64_t step;
+} Net;
+
+// SiLU: x * sigmoid(x)
+static inline float sigmoidf_fast(float x) {
+    // stable-ish sigmoid
+    if (x >= 0) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
 }
 
-static int argmax3(const float p[3]) {
-    int a = 0;
-    if (p[1] > p[a]) a = 1;
-    if (p[2] > p[a]) a = 2;
-    return a;
+static inline float siluf(float x) {
+    return x * sigmoidf_fast(x);
+}
+
+static inline float dsiluf(float x) {
+    // derivative: sigmoid(x) + x*sigmoid(x)*(1-sigmoid(x))
+    float s = sigmoidf_fast(x);
+    return s + x * s * (1.0f - s);
+}
+
+static void net_init(Net *net, float scale) {
+    memset(net, 0, sizeof(*net));
+    net->step = 0;
+    for (int i = 0; i < H; i++) {
+        net->b1[i] = 0.0f;
+        for (int j = 0; j < D; j++) {
+            net->W1[i][j] = frand_normal() * scale;
+        }
+    }
+    for (int i = 0; i < D; i++) {
+        net->b2[i] = 0.0f;
+        for (int j = 0; j < H; j++) {
+            net->W2[i][j] = frand_normal() * scale;
+        }
+    }
 }
 
 typedef struct {
-    double o, h, l, c, v;
-} Bar;
+    float pre1[H];   // a1 = W1*x + b1
+    float act1[H];   // h = SiLU(a1)
+    float out[D];    // y = W2*h + b2
+    float in[D];     // cached input
+} NetCache;
 
-static int parse_csv_doubles(const char *line, double *vals, int max_vals) {
-    const char *p = line;
-    int n = 0;
-    while (n < max_vals) {
-        char *end = NULL;
-        double v = strtod(p, &end);
-        if (end == p) break;
-        vals[n++] = v;
-        p = end;
-        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+static void net_forward(const Net *net, const float in[D], NetCache *c) {
+    memcpy(c->in, in, sizeof(float) * D);
+    for (int i = 0; i < H; i++) {
+        float s = net->b1[i];
+        for (int j = 0; j < D; j++) s += net->W1[i][j] * in[j];
+        c->pre1[i] = s;
+        c->act1[i] = siluf(s);
     }
-    return n;
-}
-
-static int load_ohlcv_csv(const char *path, Bar **out_bars) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return 0;
-
-    size_t cap = 4096;
-    size_t n = 0;
-    Bar *bars = (Bar*)calloc(cap, sizeof(Bar));
-    if (!bars) {
-        fclose(f);
-        return 0;
+    for (int i = 0; i < D; i++) {
+        float s = net->b2[i];
+        for (int j = 0; j < H; j++) s += net->W2[i][j] * c->act1[j];
+        c->out[i] = s;
     }
-
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        double vals[6];
-        int nvals = parse_csv_doubles(line, vals, 6);
-        if (nvals < 6) continue;
-        if (n >= cap) {
-            cap *= 2;
-            Bar *tmp = (Bar*)realloc(bars, cap * sizeof(Bar));
-            if (!tmp) {
-                free(bars);
-                fclose(f);
-                return 0;
-            }
-            bars = tmp;
-        }
-        bars[n].o = vals[1];
-        bars[n].h = vals[2];
-        bars[n].l = vals[3];
-        bars[n].c = vals[4];
-        bars[n].v = vals[5];
-        n++;
-    }
-    fclose(f);
-
-    *out_bars = bars;
-    return (int)n;
 }
-
-// ---------- features ----------
-typedef struct {
-    // 8 features per sample
-    // [0] ret1 scaled
-    // [1] ret5 scaled
-    // [2] mom10 (close/sma10 - 1) scaled
-    // [3] vol10 (std of ret1 over 10) scaled
-    // [4] range_pct ((h-l)/c) scaled
-    // [5] vol_norm (v/ema_v - 1) scaled
-    // [6] rsi_14 scaled to [-1..1]
-    // [7] bias 1
-    float x[8];
-    int y; // 0=SELL, 1=HOLD, 2=BUY
-} Sample;
-
-static double mean(const double *a, int n) {
-    double s = 0.0;
-    for (int i = 0; i < n; i++) s += a[i];
-    return s / (double)n;
-}
-
-static double stddev(const double *a, int n) {
-    double m = mean(a, n);
-    double s2 = 0.0;
-    for (int i = 0; i < n; i++) {
-        double d = a[i] - m;
-        s2 += d * d;
-    }
-    return sqrt(s2 / (double)(n > 1 ? (n - 1) : 1));
-}
-
-static double sma_close(const Bar *b, int i, int win) {
-    double s = 0.0;
-    for (int k = i - win + 1; k <= i; k++) s += b[k].c;
-    return s / (double)win;
-}
-
-static double ema_update(double prev, double x, double alpha) {
-    return alpha * x + (1.0 - alpha) * prev;
-}
-
-static double rsi14(const Bar *b, int i) {
-    // simple RSI over last 14 deltas
-    double gain = 0.0, loss = 0.0;
-    for (int k = i - 13; k <= i; k++) {
-        double ch = b[k].c - b[k-1].c;
-        if (ch >= 0) gain += ch;
-        else loss += -ch;
-    }
-    gain /= 14.0;
-    loss /= 14.0;
-    if (loss < 1e-12) return 100.0;
-    double rs = gain / loss;
-    double rsi = 100.0 - (100.0 / (1.0 + rs));
-    return rsi;
-}
-
-static int make_samples(const Bar *bars, int n, Sample *out, int horizon, double thr) {
-    // label by future return at i+horizon:
-    // BUY if >= +thr, SELL if <= -thr, else HOLD
-    int idx = 0;
-    double ema_v = bars[0].v;
-    const double alpha_v = 2.0 / (30.0 + 1.0); // EMA ~30
-
-    // precompute 1-step returns
-    double *r1 = (double*)calloc((size_t)n, sizeof(double));
-    for (int i = 1; i < n; i++) r1[i] = (bars[i].c / bars[i-1].c) - 1.0;
-
-    for (int i = 50; i < n - horizon; i++) {
-        ema_v = ema_update(ema_v, bars[i].v, alpha_v);
-
-        double ret1 = r1[i];
-        double ret5 = (bars[i].c / bars[i-5].c) - 1.0;
-
-        double sma10 = sma_close(bars, i, 10);
-        double mom10 = (bars[i].c / sma10) - 1.0;
-
-        double window_r[10];
-        for (int k = 0; k < 10; k++) window_r[k] = r1[i-k];
-        double vol10 = stddev(window_r, 10);
-
-        double range_pct = (bars[i].h - bars[i].l) / bars[i].c;
-        double vol_norm = (bars[i].v / (ema_v + 1e-9)) - 1.0;
-
-        double rsi = rsi14(bars, i);
-        double rsi_scaled = (rsi - 50.0) / 50.0; // [-1..+1]
-
-        double fut = (bars[i + horizon].c / bars[i].c) - 1.0;
-        int y = 1; // HOLD
-        if (fut >= thr) y = 2;       // BUY
-        else if (fut <= -thr) y = 0; // SELL
-
-        // light scaling (keeps values in nicer ranges)
-        out[idx].x[0] = (float)(ret1 * 50.0);
-        out[idx].x[1] = (float)(ret5 * 20.0);
-        out[idx].x[2] = (float)(mom10 * 30.0);
-        out[idx].x[3] = (float)(vol10 * 200.0);
-        out[idx].x[4] = (float)(range_pct * 50.0);
-        out[idx].x[5] = (float)(vol_norm * 3.0);
-        out[idx].x[6] = (float)rsi_scaled;
-        out[idx].x[7] = 1.0f;
-        out[idx].y = y;
-        idx++;
-    }
-
-    free(r1);
-    return idx;
-}
-
-// ---------- tiny recursive model (TRM-like) ----------
-#define IN_DIM 8
-#define H_DIM 96
-#define OUT_DIM 3
-#define MAX_K 63
-#define MAX_MLP_LAYERS 4
 
 typedef struct {
-    // Shared recursive block: h_t = act(b + Wx*x + Wh*h_{t-1})
-    float Wx[H_DIM][IN_DIM];
-    float Wh[H_DIM][H_DIM];
-    float b[H_DIM];
+    float dW1[H][D];
+    float db1[H];
+    float dW2[D][H];
+    float db2[D];
+} NetGrad;
 
-    // MLP layers on top of h_K
-    int mlp_layers;
-    float Wmlp[MAX_MLP_LAYERS][H_DIM][H_DIM];
-    float bmlp[MAX_MLP_LAYERS][H_DIM];
+static void netgrad_zero(NetGrad *g) {
+    memset(g, 0, sizeof(*g));
+}
 
-    // Output: logits = Wo*h + bo
-    float Wo[OUT_DIM][H_DIM];
-    float bo[OUT_DIM];
-} Model;
+static void net_backward(const Net *net, const NetCache *c, const float dout[D], NetGrad *g, float din[D]) {
+    // dout is grad wrt output (size D)
+    // Compute grads for W2,b2, then backprop to act1, pre1, then W1,b1, then input.
+
+    // dW2[i][j] += dout[i] * act1[j]
+    // db2[i] += dout[i]
+    float dact1[H] = {0};
+
+    for (int i = 0; i < D; i++) {
+        g->db2[i] += dout[i];
+        for (int j = 0; j < H; j++) {
+            g->dW2[i][j] += dout[i] * c->act1[j];
+            dact1[j] += net->W2[i][j] * dout[i];
+        }
+    }
+
+    // back through SiLU
+    float dpre1[H];
+    for (int i = 0; i < H; i++) {
+        dpre1[i] = dact1[i] * dsiluf(c->pre1[i]);
+        g->db1[i] += dpre1[i];
+    }
+
+    // dW1[i][j] += dpre1[i] * in[j]
+    // din[j] = sum_i W1[i][j]*dpre1[i]
+    for (int j = 0; j < D; j++) din[j] = 0.0f;
+    for (int i = 0; i < H; i++) {
+        for (int j = 0; j < D; j++) {
+            g->dW1[i][j] += dpre1[i] * c->in[j];
+            din[j] += net->W1[i][j] * dpre1[i];
+        }
+    }
+}
+
+static void adamw_step(Net *net, const NetGrad *g) {
+    net->step += 1;
+    float t = (float)net->step;
+
+    // bias correction
+    float b1t = 1.0f - powf(BETA1, t);
+    float b2t = 1.0f - powf(BETA2, t);
+
+    // W1
+    for (int i = 0; i < H; i++) {
+        for (int j = 0; j < D; j++) {
+            float grad = g->dW1[i][j] + WD * net->W1[i][j];
+            net->mW1[i][j] = BETA1 * net->mW1[i][j] + (1.0f - BETA1) * grad;
+            net->vW1[i][j] = BETA2 * net->vW1[i][j] + (1.0f - BETA2) * grad * grad;
+
+            float mh = net->mW1[i][j] / b1t;
+            float vh = net->vW1[i][j] / b2t;
+            net->W1[i][j] -= LR * mh / (sqrtf(vh) + EPS);
+        }
+        float gradb = g->db1[i];
+        net->mb1[i] = BETA1 * net->mb1[i] + (1.0f - BETA1) * gradb;
+        net->vb1[i] = BETA2 * net->vb1[i] + (1.0f - BETA2) * gradb * gradb;
+
+        float mhb = net->mb1[i] / b1t;
+        float vhb = net->vb1[i] / b2t;
+        net->b1[i] -= LR * mhb / (sqrtf(vhb) + EPS);
+    }
+
+    // W2
+    for (int i = 0; i < D; i++) {
+        for (int j = 0; j < H; j++) {
+            float grad = g->dW2[i][j] + WD * net->W2[i][j];
+            net->mW2[i][j] = BETA1 * net->mW2[i][j] + (1.0f - BETA1) * grad;
+            net->vW2[i][j] = BETA2 * net->vW2[i][j] + (1.0f - BETA2) * grad * grad;
+
+            float mh = net->mW2[i][j] / b1t;
+            float vh = net->vW2[i][j] / b2t;
+            net->W2[i][j] -= LR * mh / (sqrtf(vh) + EPS);
+        }
+        float gradb = g->db2[i];
+        net->mb2[i] = BETA1 * net->mb2[i] + (1.0f - BETA1) * gradb;
+        net->vb2[i] = BETA2 * net->vb2[i] + (1.0f - BETA2) * gradb * gradb;
+
+        float mhb = net->mb2[i] / b1t;
+        float vhb = net->vb2[i] / b2t;
+        net->b2[i] -= LR * mhb / (sqrtf(vhb) + EPS);
+    }
+}
+
+// ------------------------- x embedding + output head -------------------------
+//
+// x_raw: F -> x_emb: D (linear)
+// output_head: y_vec(D) -> logits(3) (linear)
 
 typedef struct {
-    float pre_rec[MAX_K+1][H_DIM];
-    float h_rec[MAX_K+1][H_DIM];
-    float pre_mlp[MAX_MLP_LAYERS][H_DIM];
-    float h_mlp[MAX_MLP_LAYERS][H_DIM];
-    int K;
-    int mlp_layers;
-} Cache;
+    float Wx[D][F];
+    float bx[D];
+
+    float Wo[3][D];
+    float bo[3];
+
+    // Adam moments
+    float mWx[D][F], vWx[D][F];
+    float mbx[D], vbx[D];
+
+    float mWo[3][D], vWo[3][D];
+    float mbo[3], vbo[3];
+
+    int64_t step;
+} Heads;
+
+static void heads_init(Heads *h, float scale) {
+    memset(h, 0, sizeof(*h));
+    h->step = 0;
+    for (int i = 0; i < D; i++) {
+        h->bx[i] = 0.0f;
+        for (int j = 0; j < F; j++) h->Wx[i][j] = frand_normal() * scale;
+    }
+    for (int i = 0; i < 3; i++) {
+        h->bo[i] = 0.0f;
+        for (int j = 0; j < D; j++) h->Wo[i][j] = frand_normal() * scale;
+    }
+}
 
 typedef struct {
-    char magic[4];
-    int version;
-    int model_bytes;
-} ModelHeader;
+    float x_raw[F];
+    float x_emb[D];
+    float y_vec[D];
+    float logits[3];
+} ForwardCache;
 
-static float frand(float scale) {
-    return (float)((urand01() * 2.0 - 1.0) * scale);
-}
-
-static void model_init(Model *m, int mlp_layers) {
-    // small init is important for stable recursion
-    float sWx = 0.08f, sWh = 0.05f, sWo = 0.08f;
-    for (int i = 0; i < H_DIM; i++) {
-        for (int j = 0; j < IN_DIM; j++) m->Wx[i][j] = frand(sWx);
-        for (int j = 0; j < H_DIM; j++) m->Wh[i][j] = frand(sWh);
-        m->b[i] = 0.01f + frand(0.01f); // small positive bias helps
-    }
-
-    m->mlp_layers = mlp_layers;
-    for (int l = 0; l < mlp_layers; l++) {
-        for (int i = 0; i < H_DIM; i++) {
-            for (int j = 0; j < H_DIM; j++) m->Wmlp[l][i][j] = frand(sWx);
-            m->bmlp[l][i] = frand(0.02f);
-        }
-    }
-
-    for (int o = 0; o < OUT_DIM; o++) {
-        for (int j = 0; j < H_DIM; j++) m->Wo[o][j] = frand(sWo);
-        m->bo[o] = frand(0.02f);
+static void embed_x(const Heads *h, const float x_raw[F], float x_emb[D]) {
+    for (int i = 0; i < D; i++) {
+        float s = h->bx[i];
+        for (int j = 0; j < F; j++) s += h->Wx[i][j] * x_raw[j];
+        x_emb[i] = s;
     }
 }
 
-static void forward(const Model *m, const float x[IN_DIM], int K, float logits[OUT_DIM], Cache *cache) {
-    if (K > MAX_K) K = MAX_K;
-    if (K < 1) K = 1;
-    cache->K = K;
-    cache->mlp_layers = m->mlp_layers;
-
-    // h0 = 0
-    zero_buf(&cache->h_rec[0][0], H_DIM);
-    zero_buf(&cache->pre_rec[0][0], H_DIM);
-
-    float tmp_wx[H_DIM];
-    float tmp_wh[H_DIM];
-
-    // recursion
-    for (int t = 1; t <= K; t++) {
-        matmul_nn(&m->Wx[0][0], x, tmp_wx, H_DIM, 1, IN_DIM);
-        matmul_nn(&m->Wh[0][0], cache->h_rec[t-1], tmp_wh, H_DIM, 1, H_DIM);
-        for (int i = 0; i < H_DIM; i++) {
-            float pre = m->b[i] + tmp_wx[i] + tmp_wh[i];
-            cache->pre_rec[t][i] = pre;
-            cache->h_rec[t][i] = act(pre);
-        }
-    }
-
-    const float *mlp_in = cache->h_rec[K];
-    for (int l = 0; l < m->mlp_layers; l++) {
-        matmul_nn(&m->Wmlp[l][0][0], mlp_in, cache->pre_mlp[l], H_DIM, 1, H_DIM);
-        for (int i = 0; i < H_DIM; i++) {
-            float pre = cache->pre_mlp[l][i] + m->bmlp[l][i];
-            cache->pre_mlp[l][i] = pre;
-            cache->h_mlp[l][i] = act(pre);
-        }
-        mlp_in = cache->h_mlp[l];
-    }
-
-    const float *out_in = (m->mlp_layers > 0) ? cache->h_mlp[m->mlp_layers - 1] : cache->h_rec[K];
-    matmul_nn(&m->Wo[0][0], out_in, logits, OUT_DIM, 1, H_DIM);
-    for (int o = 0; o < OUT_DIM; o++) {
-        logits[o] += m->bo[o];
+static void output_head(const Heads *h, const float y_vec[D], float logits[3]) {
+    for (int i = 0; i < 3; i++) {
+        float s = h->bo[i];
+        for (int j = 0; j < D; j++) s += h->Wo[i][j] * y_vec[j];
+        logits[i] = s;
     }
 }
 
-static double train_step(Model *m, const Sample *s, int K, double lr) {
-    Cache cache;
-    float logits[3], p[3];
-    forward(m, s->x, K, logits, &cache);
-    softmax3(logits, p);
+static float softmax_xent(const float logits[3], int y_true, float dlogits[3]) {
+    float m = fmaxf(logits[0], fmaxf(logits[1], logits[2]));
+    float ex0 = expf(logits[0] - m);
+    float ex1 = expf(logits[1] - m);
+    float ex2 = expf(logits[2] - m);
+    float Z = ex0 + ex1 + ex2;
+    float p0 = ex0 / Z, p1 = ex1 / Z, p2 = ex2 / Z;
 
-    // cross-entropy
-    double loss = -log((double)p[s->y] + 1e-12);
+    float loss = -logf((y_true == 0 ? p0 : (y_true == 1 ? p1 : p2)) + 1e-12f);
 
-    // class weights (tune if HOLD dominates)
-    const float class_w[3] = {1.0f, 0.6f, 1.0f};
-    float w = class_w[s->y];
-
-    // dL/dlogits = (p - y_onehot) * w
-    float dlogits[3] = { p[0], p[1], p[2] };
-    dlogits[s->y] -= 1.0f;
-    dlogits[0] *= w; dlogits[1] *= w; dlogits[2] *= w;
-
-    // grad buffers
-    float dWo[OUT_DIM][H_DIM];
-    float dbo[OUT_DIM];
-    float dWx[H_DIM][IN_DIM];
-    float dWh[H_DIM][H_DIM];
-    float db[H_DIM];
-    float dWmlp[MAX_MLP_LAYERS][H_DIM][H_DIM];
-    float dbmlp[MAX_MLP_LAYERS][H_DIM];
-
-    zero_buf(&dWo[0][0], OUT_DIM * H_DIM);
-    zero_buf(dbo, OUT_DIM);
-    zero_buf(&dWx[0][0], H_DIM * IN_DIM);
-    zero_buf(&dWh[0][0], H_DIM * H_DIM);
-    zero_buf(db, H_DIM);
-    zero_buf(&dWmlp[0][0][0], MAX_MLP_LAYERS * H_DIM * H_DIM);
-    zero_buf(&dbmlp[0][0], MAX_MLP_LAYERS * H_DIM);
-
-    // output grads and dh using OLD Wo
-    for (int o = 0; o < OUT_DIM; o++) {
-        dbo[o] += dlogits[o];
-    }
-
-    const float *out_in = (m->mlp_layers > 0) ? cache.h_mlp[m->mlp_layers - 1] : cache.h_rec[cache.K];
-    for (int o = 0; o < OUT_DIM; o++) {
-        for (int j = 0; j < H_DIM; j++) {
-            dWo[o][j] += dlogits[o] * out_in[j];
-        }
-    }
-
-    float dh[H_DIM];
-    matmul_tn(&m->Wo[0][0], dlogits, dh, H_DIM, 1, OUT_DIM);
-
-    // backprop through MLP layers
-    for (int l = m->mlp_layers - 1; l >= 0; l--) {
-        float dpre[H_DIM];
-        for (int i = 0; i < H_DIM; i++) {
-            dpre[i] = dh[i] * dact_from_pre(cache.pre_mlp[l][i]);
-            dbmlp[l][i] += dpre[i];
-        }
-
-        const float *mlp_in = (l == 0) ? cache.h_rec[cache.K] : cache.h_mlp[l - 1];
-        matmul_nt(dpre, mlp_in, &dWmlp[l][0][0], H_DIM, H_DIM, 1);
-        matmul_tn(&m->Wmlp[l][0][0], dpre, dh, H_DIM, 1, H_DIM);
-    }
-
-    // BPTT through recursion using OLD Wh
-    float dh_next[H_DIM];
-    for (int j = 0; j < H_DIM; j++) dh_next[j] = dh[j];
-
-    for (int t = cache.K; t >= 1; t--) {
-        float dpre[H_DIM];
-        for (int i = 0; i < H_DIM; i++) {
-            dpre[i] = dh_next[i] * dact_from_pre(cache.pre_rec[t][i]);
-            db[i] += dpre[i];
-        }
-
-        float tmp_wx[H_DIM * IN_DIM];
-        float tmp_wh[H_DIM * H_DIM];
-        zero_buf(tmp_wx, H_DIM * IN_DIM);
-        zero_buf(tmp_wh, H_DIM * H_DIM);
-        matmul_nt(dpre, s->x, tmp_wx, H_DIM, IN_DIM, 1);
-        matmul_nt(dpre, cache.h_rec[t-1], tmp_wh, H_DIM, H_DIM, 1);
-        add_inplace(&dWx[0][0], tmp_wx, H_DIM * IN_DIM);
-        add_inplace(&dWh[0][0], tmp_wh, H_DIM * H_DIM);
-
-        matmul_tn(&m->Wh[0][0], dpre, dh_next, H_DIM, 1, H_DIM);
-    }
-
-    // grad clipping (elementwise)
-    const float clipv = 1.0f;
-    for (int o = 0; o < OUT_DIM; o++) {
-        dbo[o] = clipf(dbo[o], -clipv, clipv);
-        for (int j = 0; j < H_DIM; j++) dWo[o][j] = clipf(dWo[o][j], -clipv, clipv);
-    }
-    for (int i = 0; i < H_DIM; i++) {
-        db[i] = clipf(db[i], -clipv, clipv);
-        for (int j = 0; j < IN_DIM; j++) dWx[i][j] = clipf(dWx[i][j], -clipv, clipv);
-        for (int j = 0; j < H_DIM; j++) dWh[i][j] = clipf(dWh[i][j], -clipv, clipv);
-    }
-    for (int l = 0; l < m->mlp_layers; l++) {
-        for (int i = 0; i < H_DIM; i++) {
-            dbmlp[l][i] = clipf(dbmlp[l][i], -clipv, clipv);
-            for (int j = 0; j < H_DIM; j++) dWmlp[l][i][j] = clipf(dWmlp[l][i][j], -clipv, clipv);
-        }
-    }
-
-    // SGD update
-    for (int o = 0; o < OUT_DIM; o++) {
-        m->bo[o] -= (float)(lr * dbo[o]);
-        for (int j = 0; j < H_DIM; j++) {
-            m->Wo[o][j] -= (float)(lr * dWo[o][j]);
-        }
-    }
-    for (int i = 0; i < H_DIM; i++) {
-        m->b[i] -= (float)(lr * db[i]);
-        for (int j = 0; j < IN_DIM; j++) {
-            m->Wx[i][j] -= (float)(lr * dWx[i][j]);
-        }
-        for (int j = 0; j < H_DIM; j++) {
-            m->Wh[i][j] -= (float)(lr * dWh[i][j]);
-        }
-    }
-    for (int l = 0; l < m->mlp_layers; l++) {
-        for (int i = 0; i < H_DIM; i++) {
-            m->bmlp[l][i] -= (float)(lr * dbmlp[l][i]);
-            for (int j = 0; j < H_DIM; j++) {
-                m->Wmlp[l][i][j] -= (float)(lr * dWmlp[l][i][j]);
-            }
-        }
-    }
-
+    dlogits[0] = p0;
+    dlogits[1] = p1;
+    dlogits[2] = p2;
+    dlogits[y_true] -= 1.0f;
     return loss;
 }
 
-static double eval_accuracy(const Model *m, const Sample *S, int n, int K) {
+typedef struct {
+    float dWx[D][F];
+    float dbx[D];
+    float dWo[3][D];
+    float dbo[3];
+} HeadsGrad;
+
+static void headsgrad_zero(HeadsGrad *g) { memset(g, 0, sizeof(*g)); }
+
+static void heads_backward_embed(const Heads *h, const float x_raw[F], const float dx_emb[D],
+                                 HeadsGrad *g) {
+    // x_emb = Wx*x_raw + bx
+    for (int i = 0; i < D; i++) {
+        g->dbx[i] += dx_emb[i];
+        for (int j = 0; j < F; j++) g->dWx[i][j] += dx_emb[i] * x_raw[j];
+    }
+    (void)h;
+}
+
+static void heads_backward_out(const Heads *h, const float y_vec[D], const float dlogits[3],
+                               HeadsGrad *g, float dy_vec[D]) {
+    // logits = Wo*y + bo
+    for (int j = 0; j < D; j++) dy_vec[j] = 0.0f;
+
+    for (int i = 0; i < 3; i++) {
+        g->dbo[i] += dlogits[i];
+        for (int j = 0; j < D; j++) {
+            g->dWo[i][j] += dlogits[i] * y_vec[j];
+            dy_vec[j] += h->Wo[i][j] * dlogits[i];
+        }
+    }
+}
+
+static void heads_adamw_step(Heads *h, const HeadsGrad *g) {
+    h->step += 1;
+    float t = (float)h->step;
+
+    float b1t = 1.0f - powf(BETA1, t);
+    float b2t = 1.0f - powf(BETA2, t);
+
+    for (int i = 0; i < D; i++) {
+        for (int j = 0; j < F; j++) {
+            float grad = g->dWx[i][j] + WD * h->Wx[i][j];
+            h->mWx[i][j] = BETA1 * h->mWx[i][j] + (1 - BETA1) * grad;
+            h->vWx[i][j] = BETA2 * h->vWx[i][j] + (1 - BETA2) * grad * grad;
+
+            float mh = h->mWx[i][j] / b1t;
+            float vh = h->vWx[i][j] / b2t;
+            h->Wx[i][j] -= LR * mh / (sqrtf(vh) + EPS);
+        }
+        float gradb = g->dbx[i];
+        h->mbx[i] = BETA1 * h->mbx[i] + (1 - BETA1) * gradb;
+        h->vbx[i] = BETA2 * h->vbx[i] + (1 - BETA2) * gradb * gradb;
+
+        float mhb = h->mbx[i] / b1t;
+        float vhb = h->vbx[i] / b2t;
+        h->bx[i] -= LR * mhb / (sqrtf(vhb) + EPS);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < D; j++) {
+            float grad = g->dWo[i][j] + WD * h->Wo[i][j];
+            h->mWo[i][j] = BETA1 * h->mWo[i][j] + (1 - BETA1) * grad;
+            h->vWo[i][j] = BETA2 * h->vWo[i][j] + (1 - BETA2) * grad * grad;
+
+            float mh = h->mWo[i][j] / b1t;
+            float vh = h->vWo[i][j] / b2t;
+            h->Wo[i][j] -= LR * mh / (sqrtf(vh) + EPS);
+        }
+        float gradb = g->dbo[i];
+        h->mbo[i] = BETA1 * h->mbo[i] + (1 - BETA1) * gradb;
+        h->vbo[i] = BETA2 * h->vbo[i] + (1 - BETA2) * gradb * gradb;
+
+        float mhb = h->mbo[i] / b1t;
+        float vhb = h->vbo[i] / b2t;
+        h->bo[i] -= LR * mhb / (sqrtf(vhb) + EPS);
+    }
+}
+
+// ------------------------- mock candle dataset -------------------------
+
+typedef struct {
+    float x[F];
+    int y;
+} Sample;
+
+static void make_features_from_series(const float *p, int t, float out[F]) {
+    // p[t] is current price, we look back a few points
+    // Features (simple):
+    // 0..7  : returns over last 8 steps
+    // 8..11 : moving average diffs (short vs long)
+    // 12    : volatility proxy (std of last 8 returns)
+    // 13    : momentum (p[t]-p[t-8])
+    // 14    : normalized price (tanh)
+    // 15    : bias term (=1)
+    float rets[8];
+    for (int i = 0; i < 8; i++) {
+        float p0 = p[t - i - 1];
+        float p1 = p[t - i];
+        rets[i] = (p1 - p0) / fmaxf(p0, 1e-6f);
+        out[i] = rets[i];
+    }
+
+    // MA diffs
+    float ma2 = 0, ma4 = 0, ma8 = 0, ma16 = 0;
+    for (int i = 0; i < 2; i++)  ma2  += p[t - i];
+    for (int i = 0; i < 4; i++)  ma4  += p[t - i];
+    for (int i = 0; i < 8; i++)  ma8  += p[t - i];
+    for (int i = 0; i < 16; i++) ma16 += p[t - i];
+    ma2  /= 2.0f; ma4 /= 4.0f; ma8 /= 8.0f; ma16 /= 16.0f;
+
+    out[8]  = (ma2 - ma8)  / fmaxf(ma8,  1e-6f);
+    out[9]  = (ma4 - ma16) / fmaxf(ma16, 1e-6f);
+    out[10] = (ma2 - ma16) / fmaxf(ma16, 1e-6f);
+    out[11] = (ma8 - ma16) / fmaxf(ma16, 1e-6f);
+
+    // volatility
+    float mean = 0;
+    for (int i = 0; i < 8; i++) mean += rets[i];
+    mean /= 8.0f;
+    float var = 0;
+    for (int i = 0; i < 8; i++) {
+        float d = rets[i] - mean;
+        var += d * d;
+    }
+    var /= 8.0f;
+    out[12] = sqrtf(var);
+
+    // momentum
+    out[13] = (p[t] - p[t - 8]) / fmaxf(p[t - 8], 1e-6f);
+
+    // normalized price
+    out[14] = tanhf(0.01f * (p[t] - 100.0f));
+
+    out[15] = 1.0f;
+}
+
+static void gen_dataset(Sample *dst, int n_samples, int seed_offset) {
+    // Random-walk series, then slice samples from it
+    // Need at least 16 lookback + horizon for labeling.
+    g_rng ^= (uint64_t)(0x9e3779b97f4a7c15ULL + (uint64_t)seed_offset);
+
+    const int series_len = n_samples + 64;
+    float *p = (float*)malloc(sizeof(float) * series_len);
+    if (!p) exit(1);
+
+    float price = 100.0f;
+    for (int t = 0; t < series_len; t++) {
+        float step = 0.001f * frand_normal(); // small driftless noise
+        price = fmaxf(1.0f, price * (1.0f + step));
+        p[t] = price;
+    }
+
+    const int lookback = 16;
+    const int horizon = 8;
+    const float thr = 0.006f; // 0.6%
+
+    for (int i = 0; i < n_samples; i++) {
+        int t = i + lookback; // ensure history exists
+        make_features_from_series(p, t, dst[i].x);
+
+        float future = p[t + horizon];
+        float cur = p[t];
+        float fut_ret = (future - cur) / fmaxf(cur, 1e-6f);
+
+        int y = CLS_WAIT;
+        if (fut_ret > thr) y = CLS_LONG;
+        else if (fut_ret < -thr) y = CLS_SHORT;
+        dst[i].y = y;
+    }
+
+    free(p);
+}
+
+// ------------------------- TRM forward (no grad) -------------------------
+
+static void vec_zero(float v[D]) { for (int i = 0; i < D; i++) v[i] = 0.0f; }
+
+static void vec_add3(float out[D], const float a[D], const float b[D], const float c[D]) {
+    for (int i = 0; i < D; i++) out[i] = a[i] + b[i] + c[i];
+}
+
+static void vec_add2(float out[D], const float a[D], const float b[D]) {
+    for (int i = 0; i < D; i++) out[i] = a[i] + b[i];
+}
+
+// One latent recursion cycle (no grad): update z n times using x+y+z, then update y once using y+z
+static void latent_recursion_nograd(const Net *net, const float x_emb[D], float y[D], float z[D]) {
+    float inp[D];
+    NetCache c;
+
+    for (int i = 0; i < N_LAT; i++) {
+        vec_add3(inp, x_emb, y, z);
+        net_forward(net, inp, &c);
+        memcpy(z, c.out, sizeof(float) * D);
+    }
+    vec_add2(inp, y, z);
+    net_forward(net, inp, &c);
+    memcpy(y, c.out, sizeof(float) * D);
+}
+
+// Deep recursion: do T-1 cycles without grad, then one "with grad" (handled separately in train)
+static void deep_recursion_nograd(const Net *net, const float x_emb[D], float y[D], float z[D]) {
+    for (int j = 0; j < T_REC; j++) latent_recursion_nograd(net, x_emb, y, z);
+}
+
+// ------------------------- TRM train: backprop through last recursion only -------------------------
+//
+// We mimic paper's: do (T-1) cycles no-grad, then last cycle with grad.
+// And within that last cycle, we backprop through ALL (N_LAT z-updates + 1 y-update).
+
+typedef struct {
+    NetCache caches_z[N_LAT];
+    NetCache cache_y;
+    float z_in[N_LAT][D];  // store z input vectors per step (not strictly necessary since in cache)
+    float y_in[D];         // input to y-update
+    float x_emb[D];
+    float y_before[D];
+    float z_before[D];
+    float y_after[D];
+    float z_after[D];
+} RecGradCache;
+
+static void latent_recursion_withgrad_forward(const Net *net, const float x_emb[D],
+                                             float y[D], float z[D],
+                                             RecGradCache *rc) {
+    memcpy(rc->x_emb, x_emb, sizeof(float)*D);
+    memcpy(rc->y_before, y, sizeof(float)*D);
+    memcpy(rc->z_before, z, sizeof(float)*D);
+
+    float inp[D];
+
+    for (int i = 0; i < N_LAT; i++) {
+        vec_add3(inp, x_emb, y, z);
+        net_forward(net, inp, &rc->caches_z[i]);
+        memcpy(z, rc->caches_z[i].out, sizeof(float)*D);
+    }
+
+    vec_add2(inp, y, z);
+    memcpy(rc->y_in, inp, sizeof(float)*D);
+    net_forward(net, inp, &rc->cache_y);
+    memcpy(y, rc->cache_y.out, sizeof(float)*D);
+
+    memcpy(rc->y_after, y, sizeof(float)*D);
+    memcpy(rc->z_after, z, sizeof(float)*D);
+}
+
+static void latent_recursion_withgrad_backward(const Net *net, const RecGradCache *rc,
+                                              const float dy_after[D], // grad wrt final y (from loss)
+                                              NetGrad *g_net,
+                                              float dx_emb[D]) {
+    // Backprop through:
+    // y_after = net(y_in = y_before + z_after)
+    // z_after = z_NLAT after N_LAT steps, each z_{k+1} = net(x_emb + y_before + z_k)
+    //
+    // y_before is treated as constant w.r.t this recursion (in paper, y carried; in principle gradients flow,
+    // but this toy keeps it simple: gradients only through nets + x_emb).
+    // We'll let gradients flow into x_emb and z.
+
+    float dy_in[D];
+    float din[D];
+
+    // 1) y-update net backward
+    net_backward(net, &rc->cache_y, dy_after, g_net, din); // din = d(y_in)
+    memcpy(dy_in, din, sizeof(float)*D);
+
+    // y_in = y_before + z_after
+    // so grad splits: d z_after += dy_in ; (and d y_before += dy_in, ignored)
+    float dz[D];
+    memcpy(dz, dy_in, sizeof(float)*D);
+
+    // 2) backprop through z updates in reverse
+    float dx_acc[D]; for (int i=0;i<D;i++) dx_acc[i]=0.0f;
+
+    for (int step = N_LAT - 1; step >= 0; step--) {
+        // z_{step+1} = net( x_emb + y_before + z_step )
+        // rc->caches_z[step] corresponds to that net forward.
+        float din2[D];
+        net_backward(net, &rc->caches_z[step], dz, g_net, din2); // din2 = d(input_to_net)
+
+        // input_to_net = x_emb + y_before + z_step
+        // so: dx_emb += din2; dz = din2 (for z_step); (and dy_before += din2, ignored)
+        for (int i = 0; i < D; i++) {
+            dx_acc[i] += din2[i];
+            dz[i] = din2[i];
+        }
+    }
+
+    memcpy(dx_emb, dx_acc, sizeof(float)*D);
+}
+
+// ------------------------- training / eval -------------------------
+
+static int argmax3(const float a[3]) {
+    int m = 0;
+    if (a[1] > a[m]) m = 1;
+    if (a[2] > a[m]) m = 2;
+    return m;
+}
+
+static float eval_accuracy(const Net *net, const Heads *heads, const Sample *data, int n) {
     int correct = 0;
-    Cache cache;
+    float y[D], z[D], x_emb[D];
     for (int i = 0; i < n; i++) {
-        float logits[3], p[3];
-        forward(m, S[i].x, K, logits, &cache);
-        softmax3(logits, p);
-        int pred = argmax3(p);
-        if (pred == S[i].y) correct++;
+        embed_x(heads, data[i].x, x_emb);
+        vec_zero(y);
+        vec_zero(z);
+
+        // test-time: run full N_SUP steps (like paper does)
+        for (int step = 0; step < N_SUP; step++) {
+            // deep recursion T times (all no-grad)
+            for (int j = 0; j < T_REC; j++) latent_recursion_nograd(net, x_emb, y, z);
+        }
+
+        float logits[3];
+        output_head(heads, y, logits);
+        int pred = argmax3(logits);
+        if (pred == data[i].y) correct++;
     }
-    return (double)correct / (double)n;
+    return (float)correct / (float)n;
 }
 
-static void evaluate_model(const Model *m, const Sample *S, int n, int K) {
-    int conf[3][3] = {0};
-    Cache cache;
-    for (int i = 0; i < n; i++) {
-        float logits[3], p[3];
-        forward(m, S[i].x, K, logits, &cache);
-        softmax3(logits, p);
-        int pred = argmax3(p);
-        conf[S[i].y][pred]++;
-    }
+int main(void) {
+    printf("Toy TRM (C) - candle mock classification: SHORT/WAIT/LONG\n");
 
-    printf("\nFinal evaluation:\n");
-    printf("Confusion matrix (rows=true, cols=pred):\n");
-    for (int r = 0; r < 3; r++) {
-        printf("%d %d %d\n", conf[r][0], conf[r][1], conf[r][2]);
-    }
+    Sample *train = (Sample*)malloc(sizeof(Sample) * TRAIN_SAMPLES);
+    Sample *test  = (Sample*)malloc(sizeof(Sample) * TEST_SAMPLES);
+    if (!train || !test) { fprintf(stderr, "alloc failed\n"); return 1; }
 
-    int correct = conf[0][0] + conf[1][1] + conf[2][2];
-    printf("Accuracy: %.3f\n", (double)correct / (double)n);
-}
+    gen_dataset(train, TRAIN_SAMPLES, 1);
+    gen_dataset(test,  TEST_SAMPLES,  2);
 
-static int save_model(const char *path, const Model *m) {
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        return 0;
-    }
-    ModelHeader header = { {'T', 'R', 'M', '1'}, 1, (int)sizeof(Model) };
-    if (fwrite(&header, sizeof(header), 1, f) != 1) {
-        fclose(f);
-        return 0;
-    }
-    if (fwrite(m, sizeof(Model), 1, f) != 1) {
-        fclose(f);
-        return 0;
-    }
-    fclose(f);
-    return 1;
-}
+    Net net;
+    Heads heads;
+    net_init(&net, 0.02f);
+    heads_init(&heads, 0.02f);
 
-static int load_model(const char *path, Model *m) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return 0;
-    }
-    ModelHeader header;
-    if (fread(&header, sizeof(header), 1, f) != 1) {
-        fclose(f);
-        return 0;
-    }
-    if (memcmp(header.magic, "TRM1", 4) != 0 || header.version != 1 ||
-        header.model_bytes != (int)sizeof(Model)) {
-        fclose(f);
-        return 0;
-    }
-    if (fread(m, sizeof(Model), 1, f) != 1) {
-        fclose(f);
-        return 0;
-    }
-    fclose(f);
-    return 1;
-}
+    // training
+    int steps_per_epoch = TRAIN_SAMPLES / BATCH;
 
-// ---------- main ----------
-int main(int argc, char **argv) {
-    const char *csv_path = "binance_ohlcv.csv";
-    int mlp_layers = 1;
-    const char *save_path = NULL;
-    const char *load_path = NULL;
-    int eval_only = 0;
+    for (int epoch = 1; epoch <= EPOCHS; epoch++) {
+        float epoch_loss = 0.0f;
 
-    int positional = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
-            save_path = argv[++i];
-            continue;
+        // simple shuffle
+        for (int i = 0; i < TRAIN_SAMPLES; i++) {
+            int j = (int)(frand_uniform() * TRAIN_SAMPLES);
+            Sample tmp = train[i];
+            train[i] = train[j];
+            train[j] = tmp;
         }
-        if (strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
-            load_path = argv[++i];
-            continue;
+
+        for (int it = 0; it < steps_per_epoch; it++) {
+            NetGrad gnet; netgrad_zero(&gnet);
+            HeadsGrad gh; headsgrad_zero(&gh);
+
+            float batch_loss = 0.0f;
+
+            for (int b = 0; b < BATCH; b++) {
+                const Sample *s = &train[it * BATCH + b];
+
+                float x_emb[D];
+                embed_x(&heads, s->x, x_emb);
+
+                float y[D], z[D];
+                vec_zero(y);
+                vec_zero(z);
+
+                // deep supervision steps
+                // Each step: do (T-1) cycles no-grad, then 1 cycle with grad, compute loss on y, update y,z (detached)
+                for (int sup = 0; sup < N_SUP; sup++) {
+                    // (T-1) cycles no-grad
+                    for (int j = 0; j < T_REC - 1; j++) latent_recursion_nograd(&net, x_emb, y, z);
+
+                    // last cycle with grad
+                    RecGradCache rc;
+                    latent_recursion_withgrad_forward(&net, x_emb, y, z, &rc);
+
+                    // output head + xent
+                    float logits[3], dlogits[3];
+                    output_head(&heads, y, logits);
+                    float loss = softmax_xent(logits, s->y, dlogits);
+                    batch_loss += loss;
+
+                    // backprop through output head into y
+                    float dy_vec[D];
+                    heads_backward_out(&heads, y, dlogits, &gh, dy_vec);
+
+                    // backprop through the last recursion into net params and into x_emb (then into Wx)
+                    float dx_emb[D];
+                    latent_recursion_withgrad_backward(&net, &rc, dy_vec, &gnet, dx_emb);
+
+                    // backprop dx_emb into embed Wx
+                    heads_backward_embed(&heads, s->x, dx_emb, &gh);
+
+                    // detach y,z (already values are in y,z; we just keep them as new init)
+                    // Optional early stop (paper uses halting head); here we skip for simplicity.
+                }
+            }
+
+            // average grads over batch
+            float invB = 1.0f / (float)BATCH;
+            for (int i = 0; i < H; i++) {
+                gnet.db1[i] *= invB;
+                for (int j = 0; j < D; j++) gnet.dW1[i][j] *= invB;
+            }
+            for (int i = 0; i < D; i++) {
+                gnet.db2[i] *= invB;
+                for (int j = 0; j < H; j++) gnet.dW2[i][j] *= invB;
+            }
+            for (int i = 0; i < D; i++) {
+                gh.dbx[i] *= invB;
+                for (int j = 0; j < F; j++) gh.dWx[i][j] *= invB;
+            }
+            for (int i = 0; i < 3; i++) {
+                gh.dbo[i] *= invB;
+                for (int j = 0; j < D; j++) gh.dWo[i][j] *= invB;
+            }
+
+            adamw_step(&net, &gnet);
+            heads_adamw_step(&heads, &gh);
+
+            batch_loss *= invB;
+            epoch_loss += batch_loss;
         }
-        if (strcmp(argv[i], "--eval") == 0) {
-            eval_only = 1;
-            continue;
-        }
-        if (argv[i][0] == '-') {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            return 1;
-        }
-        if (positional == 0) {
-            csv_path = argv[i];
-            positional++;
-        } else if (positional == 1) {
-            mlp_layers = atoi(argv[i]);
-            positional++;
-        }
-    }
-    if (mlp_layers < 0) mlp_layers = 0;
-    if (mlp_layers > MAX_MLP_LAYERS) mlp_layers = MAX_MLP_LAYERS;
 
-    Bar *bars = NULL;
-    int nBars = load_ohlcv_csv(csv_path, &bars);
-    if (nBars <= 0) {
-        fprintf(stderr, "Failed to load OHLCV data from %s\n", csv_path);
-        return 1;
-    }
-    printf("Loaded %d bars from %s\n", nBars, csv_path);
+        epoch_loss /= (float)steps_per_epoch;
 
-    // 2) samples
-    const int HORIZON = 8;      // label based on close at t+8
-    const double THR = 0.004;   // +/-0.4% threshold for BUY/SELL (try 0.002 if HOLD dominates)
-    Sample *samples = (Sample*)calloc((size_t)nBars, sizeof(Sample));
-    int nS = make_samples(bars, nBars, samples, HORIZON, THR);
+        float acc_train = eval_accuracy(&net, &heads, train, 500); // quick probe
+        float acc_test  = eval_accuracy(&net, &heads, test, TEST_SAMPLES);
 
-    // label distribution
-    int cnt[3] = {0, 0, 0};
-    for (int i = 0; i < nS; i++) cnt[samples[i].y]++;
-    printf("Samples=%d | Label dist: SELL=%d HOLD=%d BUY=%d\n", nS, cnt[0], cnt[1], cnt[2]);
-
-    // 3) split train/test (time-based)
-    int nTrain = (int)(nS * 0.8);
-    int nTest = nS - nTrain;
-    Sample *trainS = samples;
-    Sample *testS = samples + nTrain;
-
-    // 4) init model
-    Model m;
-    if (load_path) {
-        if (!load_model(load_path, &m)) {
-            fprintf(stderr, "Failed to load model from %s\n", load_path);
-            return 1;
-        }
-        mlp_layers = m.mlp_layers;
-        printf("Loaded model from %s (mlp_layers=%d)\n", load_path, mlp_layers);
-    } else {
-        model_init(&m, mlp_layers);
-    }
-
-    const int K = 4;            // start with 4 (stable), try 8 later
-
-    if (eval_only) {
-        evaluate_model(&m, testS, nTest, K);
-        free(samples);
-        free(bars);
-        return 0;
-    }
-
-    // 5) train
-    const int EPOCHS = 200;
-    double lr = 0.001;
-
-    for (int e = 1; e <= EPOCHS; e++) {
-        double loss_sum = 0.0;
-        for (int i = 0; i < nTrain; i++) {
-            loss_sum += train_step(&m, &trainS[i], K, lr);
-        }
-        double train_acc = eval_accuracy(&m, trainS, nTrain, K);
-        double test_acc  = eval_accuracy(&m, testS, nTest, K);
-
-        printf("Epoch %d | loss=%.4f | train_acc=%.3f | test_acc=%.3f | lr=%.6f\n",
-               e, loss_sum / (double)nTrain, train_acc, test_acc, lr);
+        printf("Epoch %2d | loss=%.4f | train_acc~%.3f | test_acc=%.3f\n",
+               epoch, epoch_loss, acc_train, acc_test);
     }
 
-    evaluate_model(&m, testS, nTest, K);
-
-    if (save_path) {
-        if (save_model(save_path, &m)) {
-            printf("Saved model to %s\n", save_path);
-        } else {
-            fprintf(stderr, "Failed to save model to %s\n", save_path);
-            return 1;
-        }
-    }
-
-    // 6) show a few predictions
-    printf("\nSample predictions (0=SELL,1=HOLD,2=BUY):\n");
-    for (int i = 0; i < 10 && i < nTest; i++) {
-        Cache cache;
-        float logits[3], p[3];
-        forward(&m, testS[i].x, K, logits, &cache);
-        softmax3(logits, p);
-        int pred = argmax3(p);
-        printf("y=%d pred=%d probs=[%.2f %.2f %.2f]\n", testS[i].y, pred, p[0], p[1], p[2]);
-    }
-
-    free(samples);
-    free(bars);
+    free(train);
+    free(test);
     return 0;
 }
