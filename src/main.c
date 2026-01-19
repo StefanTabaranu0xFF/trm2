@@ -591,6 +591,7 @@ static int build_dataset_from_prices(
     const int lookback = 16;
     const int horizon = 8;
     const float thr = 0.006f;
+    float *scaled = NULL;
 
     int max_samples = price_count - lookback - horizon;
     if (max_samples <= 0) {
@@ -607,20 +608,28 @@ static int build_dataset_from_prices(
 
     Sample *train = (Sample *)malloc(sizeof(Sample) * train_count);
     Sample *test = (Sample *)malloc(sizeof(Sample) * test_count);
-    if (!train || !test) {
+    scaled = (float *)malloc(sizeof(float) * price_count);
+    if (!train || !test || !scaled) {
         fprintf(stderr, "alloc failed\n");
         free(train);
         free(test);
+        free(scaled);
         return 0;
+    }
+
+    float base = prices[0];
+    if (base == 0.0f) base = 1.0f;
+    for (int i = 0; i < price_count; i++) {
+        scaled[i] = (prices[i] / base) * 100.0f;
     }
 
     for (int i = 0; i < max_samples; i++) {
         int t = i + lookback;
         Sample *dst = (i < train_count) ? &train[i] : &test[i - train_count];
-        make_features_from_series(prices, t, dst->x);
+        make_features_from_series(scaled, t, dst->x);
 
-        float future = prices[t + horizon];
-        float cur = prices[t];
+        float future = scaled[t + horizon];
+        float cur = scaled[t];
         float fut_ret = (future - cur) / fmaxf(cur, 1e-6f);
 
         int y = CLS_WAIT;
@@ -633,6 +642,7 @@ static int build_dataset_from_prices(
     *out_train_count = train_count;
     *out_test = test;
     *out_test_count = test_count;
+    free(scaled);
     return 1;
 }
 
@@ -784,6 +794,16 @@ static float eval_accuracy(const Net *net, const Heads *heads, const Sample *dat
     return (float)correct / (float)n;
 }
 
+static void print_label_stats(const Sample *data, int n, const char *label) {
+    int counts[3] = {0, 0, 0};
+    for (int i = 0; i < n; i++) {
+        int y = data[i].y;
+        if (y >= 0 && y < 3) counts[y]++;
+    }
+    printf("%s label distribution: SHORT=%d WAIT=%d LONG=%d\n",
+           label, counts[CLS_SHORT], counts[CLS_WAIT], counts[CLS_LONG]);
+}
+
 int main(int argc, char **argv) {
     printf("Toy TRM (C) - candle mock classification: SHORT/WAIT/LONG\n");
 
@@ -810,6 +830,8 @@ int main(int argc, char **argv) {
         }
         printf("Loaded %d prices from %s (train=%d, test=%d)\n",
                price_count, csv_path, train_count, test_count);
+        print_label_stats(train, train_count, "Train");
+        print_label_stats(test, test_count, "Test");
     } else {
         train = (Sample*)malloc(sizeof(Sample) * TRAIN_SAMPLES);
         test  = (Sample*)malloc(sizeof(Sample) * TEST_SAMPLES);
